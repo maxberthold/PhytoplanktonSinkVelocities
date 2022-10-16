@@ -1,0 +1,425 @@
+---
+title: "SinkCytometer_import"
+output: html_notebook
+
+Author: Maximilian Berthold
+
+---
+
+#Below are the parameters for the data import of the Cytometer data.
+
+```{r}
+
+Project <- "PhytoSink"
+FP1 <- ".."
+DataIn <- "RawData"
+DataOut <- "TidyData"
+FileID <- "sink"
+SkipSink = 0
+FileEncodeCS <- "UTF-8"
+DelimCS <- ","
+
+```
+
+#Packages needed.
+
+```{r load libraries,  message = FALSE, warning = FALSE, echo=FALSE}
+
+library(tidyverse)
+library(lubridate)
+library(stringr)
+library(broom)
+library(knitr)
+library(OneR)
+library(zoo)
+library(xts)
+library(strucchange)
+library(chngpt)
+library(segmented)
+library(googledrive)
+library(googlesheets4)
+  
+```
+
+#Loading in the other data frames needed for joining.
+
+
+```{r load local catalog, message = FALSE, warning = FALSE, echo=FALSE}
+#deauthorizes access to googlesheet
+gs4_deauth()
+
+MetaData <- read_sheet("https://docs.google.com/spreadsheets/d/1jBRuKWXGL9MDtD3e_NGhhrhWPrB0OdJ8XmJRKQrg0Oo/edit#gid=0")
+SinkProt <- read_sheet("https://docs.google.com/spreadsheets/d/1ya-DkakngUYXZce1Ty0l2oX5AvULkLLayoCAgkSexRs/edit?pli=1#gid=0") %>%
+  mutate(date_sink = ymd(date_sink))
+
+```
+
+
+```{r}
+SinkFiles <- list.files(path = paste(FP1, DataIn, sep = "/"), pattern = FileID, full.names = TRUE)
+
+unique(duplicated(SinkFiles))
+
+fread_plus <- function(Flnm, Skip, FileEncode, Delim){data.table::fread(file = Flnm, skip = Skip, encoding = FileEncode, sep = Delim, header = TRUE) %>%
+    mutate(Filename = Flnm)
+}
+
+SinkFile <- SinkFiles %>%
+  map_df(~fread_plus(Flnm = ., Skip = SkipSink, FileEncode = FileEncodeCS, Delim = DelimCS))
+    
+```
+
+#Data insertion and joining of various dataframes:
+
+```{r}
+
+SinkTidy <- SinkFile %>%
+  separate(col = Filename, into = c("fp1", "fp2", "fp3", "DataIn", "datetime", "Project", "Exp", "plate", "FromPlate", "ToPlate", "strain", "Descr",  "csv"), sep = "([\\/\\_\\.\\:])", remove = FALSE) %>%
+  dplyr::select(-c(fp1, DataIn, csv, Project, FromPlate, ToPlate, plate,fp2, fp3, Descr, Filename)) %>%
+  mutate(datetime = ymd_hm(datetime)) %>%
+  separate(datetime, into = c("date_sink", "time_sink"), sep = " ", remove = FALSE) %>%
+  mutate(date_sink = ymd(date_sink), time_sink = hms(time_sink)) %>%
+  purrr::keep(~!all(is.na(.))) %>%
+  rename("well_target" = "Well Name")
+
+
+
+SinkMetaAll <- inner_join(SinkTidy, SinkProt, by = c("well_target", "date_sink", "strain")) %>% 
+  rename("TimeID" = "T Id", "well" = "well_source", "cellcount" = "Cell Count", "plate" = "plate_origin", "TotalCellArea" = "Total Area", "AverageCellArea" = "Average Area", "CellTotalIntensity" = "Cell Total Intensity", "CellAverageIntensity" = "Cell Average Intensity", "CellTotalIntegratedIntensity" = "Cell Total Integrated Intensity", "CellAverageIntegratedIntensity" = "Cell Average Integrated Intensity") %>%
+  distinct()%>%
+  mutate(ElapMin = TimeID * 10)
+  
+
+
+SinkMetaAll2 <- full_join(SinkMetaAll, MetaData, by = c("strain", "plate", "well")) %>%
+  mutate(exp_date = paste0(exp_date, "080000")) %>%
+  mutate(exp_date = ymd_hms(as.numeric(exp_date))) %>%
+  #mutate(ElapMin = as.numeric(hms(Elapsed.Time.m))/60) %>%
+  group_by(strain, plate) %>% mutate(ElapDay = as.numeric((datetime - exp_date[1])/24)) %>% ungroup() %>%
+  mutate(well_radius_mm = case_when(plate_type == "Greiner655090" ~ 3.29),
+         tot_vol_uL = culture_vol_uL + media_vol_uL,
+         sink_height_mm = tot_vol_uL/(pi*well_radius_mm^2)) %>%
+  group_by(id) %>%
+  drop_na(cellcount) %>%
+  mutate(sink_diff = cellcount - cellcount[1])
+
+SinkMetaAll2 %>%
+  filter(strain == "CCMP495") %>%
+  ggplot() +
+  geom_line(aes(x = ElapMin, y = (sink_diff), color = as.factor(well))) +
+  facet_grid(
+    #rows = vars(strain), 
+    cols = vars(par_ue)) +
+  theme_classic()
+
+
+```
+
+
+
+```{r}
+
+
+lm2 <- function(data, ...) {  
+    eval( rlang::expr(lm(data=!!rlang::enexpr(data), !!!list(...))) ) } #https://stackoverflow.com/questions/58525603/error-using-segmented-with-lm-extracted-from-output-of-tidyverse-map-in-r ; lm2 misses {} in the original answer
+
+glm2 <- function(.df, ...) {
+  eval(rlang::expr(glm(!!rlang::enexpr(.df),!!!list(...)))) }
+#https://stackoverflow.com/questions/57319130/purrrmap-and-glm-issues-with-call/57528229
+
+formul  = ElapMin ~ cellcount
+    
+SinkSegm <- SinkMetaAll2 %>%
+  mutate(DateTime = paste(date_sink, Elapsed.Time.m)) %>%
+  mutate(DateTime = ymd_hms(DateTime)) %>%
+  drop_na("DateTime") %>%
+  select(-c(CellAverageIntegratedIntensity, CellTotalIntegratedIntensity)) %>%
+  nest(seg_data = c(ElapMin, cellcount, Elapsed.Time.m, CellAverageIntensity, CellTotalIntensity, TotalCellArea, AverageCellArea, DateTime)) %>%
+  mutate(fit_lm = map(seg_data, lm2, cellcount ~ ElapMin),
+         #            param_lm = map(fit_lm, tidy),
+         #            pred_lm = map(fit_lm, augment),
+         #            qual_lm = map(fit_lm, glance),
+         # fit_qp = map(data, glm2, formula = formul , family = quasipoisson(link = "log")),
+         #            param_qp = map(fit_qp, tidy),
+         #            pred_qp = map(fit_qp, augment),
+         #            qual_qp = map(fit_qp, glance),
+         fit_seg_lm = map(fit_lm, segmented, seg.Z = ~ElapMin, npsi = 2),
+                    # summary_segmented = map(fit_seg_lm, summary), 
+                    coef_seg = map(fit_seg_lm, ~coef.segmented(.x, include.psi = TRUE)),
+                    list_coef = map(coef_seg, as.list),
+                    tibble_coef = map(list_coef, as_tibble)) %>% 
+  unnest(c(tibble_coef)) %>% #https://stackoverflow.com/questions/51181888/r-extracting-model-coefficients-from-a-nested-list-list-columns
+  rename(ElapMin_Seg = ElapMin) %>%
+  unnest(seg_data) %>%
+  select(-fit_lm) 
+
+SinkSect <- SinkSegm %>%
+  group_by(id, date_sink) %>%
+  mutate(BP_sect = case_when(ElapMin <= psi1.ElapMin ~ "BP_sec1",
+                            (psi1.ElapMin < ElapMin) & (psi2.ElapMin > ElapMin) ~ "BP_sec2",
+                             psi2.ElapMin < ElapMin ~ "BP_sec3",
+                            TRUE ~ "no_bp"),
+         diffSizeTot = min(AverageCellArea) - max(AverageCellArea)) %>%
+  group_by(id, date_sink, BP_sect) %>%
+  mutate(sink_time = max(ElapMin) - min(ElapMin),
+         sink_vel_mm_min = sink_height_mm/sink_time) %>% 
+  nest(bp_data = c(ElapMin, cellcount, Elapsed.Time.m, CellAverageIntensity, CellTotalIntensity, TotalCellArea, AverageCellArea, DateTime)) %>%
+  mutate(fit_seg = map(bp_data, lm2, cellcount ~ ElapMin), 
+         sum_seg = map(fit_seg, summary),
+         bp_data = map(.x = bp_data, .f = ~mutate(.x, (min(AverageCellArea) - max(AverageCellArea))))) %>%
+  unnest(bp_data) %>%
+  rename(diffSizeBP = "(min(AverageCellArea) - max(AverageCellArea))")
+  
+
+
+SinkPlot <- SinkSect %>% 
+  #filter(BP_sect == "BP_sec1") %>%
+  #filter(strain %in% c("NIES981", "CCMP1333", "CCMP836")) %>%
+  #filter(strain %in% c("CCMP495", "CCMP1335", "CCMP1336")) %>%
+  filter(par_ue != "NA") %>%
+  filter(par_ue == "300") %>%
+  ggplot() +
+  #ggtitle("Plot of Diaton, CCMP495") +
+  ylab("Sinking velocity mm/min") +
+  xlab("Elapsed day") +
+  labs(color = "PAR (µE)") +
+  geom_point(aes(x = ElapDay, y = sink_vel_mm_min, color = as.factor(BP_sect))) +
+  ylim(0, 0.3) +
+  #scale_y_continuous(trans = "reverse") + #reverses the y-axis
+  facet_grid(rows = vars(strain)) +
+  theme_classic()
+
+SinkPlot
+
+#ggsave(filename = file.path("Plots", paste(Project,"SinkVelocity_Test.png", sep = "_"), fsep = .Platform$file.sep), plot = SinkPlot, height = 4, width = 6)
+
+
+
+
+```
+
+#Plots of all strains for all dates of measurements besides the start date.
+
+#Cyanobacteria plots 
+```{r}
+
+SinkMetaAll2 %>% 
+  #filter(!date_sink == "2021-02-20") %>%
+  filter(strain == "CCMP1333") %>%
+  filter(!well_target == "B3") %>%
+  filter(!well_target == "B6") %>%
+  filter(!well_target == "B7") %>%
+  filter(!well_target == "B8") %>%
+  filter(!well_target == "B9") %>%
+  drop_na("par_ue") %>%
+  ggplot() + 
+  ggtitle("Plot of Cyanobacteria, CCMP1333") +
+  ylab("Cell Count per ml") +
+  xlab("Elapsed Time (min)") +
+  labs(color = "Dates of measurement") +
+  geom_point(aes(x = ElapMin, y = (AverageCellArea), color = as.factor(datetime))) +
+  #scale_y_continuous(trans = "reverse") + #reverses the y-axis
+  facet_grid (cols = vars(par_ue)) +
+  theme_classic()
+
+SinkMetaAll2 %>% 
+  #filter(!date_sink == "2021-02-20") %>%
+  filter(strain == "CCMP836") %>%
+  filter(!well_target == "C3") %>%
+  filter(!well_target == "C6") %>%
+  filter(!well_target == "C7") %>%
+  filter(!well_target == "C8") %>%
+  filter(!well_target == "C10") %>%
+  drop_na("par_ue") %>%
+  ggplot() + 
+  ggtitle("Plot of Cyanobacteria, CCMP836") +
+  ylab("Cell Count per ml") +
+  xlab("Elapsed Time (min)") +
+  labs(color = "Dates of measurement") +
+  geom_point(aes(x = ElapMin, y = AverageCellArea, color = as.factor(datetime))) +
+  #scale_y_continuous(trans = "reverse") + #reverses the y-axis
+  facet_grid (cols = vars(par_ue)) +
+  theme_classic()
+
+SinkMetaAll2 %>% 
+  #filter(!date_sink == "2021-02-20") %>%
+  filter(strain == "NIES981") %>%
+  filter(!well_target == "D3") %>%
+  filter(!well_target == "D6") %>%
+  filter(!well_target == "D7") %>%
+  filter(!well_target == "D8") %>%
+  filter(!well_target == "D10") %>%
+  drop_na("par_ue") %>%
+  ggplot() + 
+  ggtitle("Plot of Cyanobacteria, NIES981") +
+  ylab("Cell Count per ml") +
+  xlab("Elapsed Time (min)") +
+  labs(color = "Dates of measurement") +
+  geom_point(aes(x = ElapMin, y = AverageCellArea, color = as.factor(datetime))) +
+  #scale_y_continuous(trans = "reverse") + #reverses the y-axis
+  facet_grid (cols = vars(par_ue)) +
+  theme_classic()
+
+```
+
+#Diatom plots
+
+```{r}
+
+SinkMetaAll2 %>% 
+  filter(!date_sink == "2021-02-17") %>%
+  filter(strain == "CCMP1336") %>%
+  filter(!well_target == "G3") %>%
+  filter(!well_target == "G6") %>%
+  filter(!well_target =="G5") %>%
+  filter(!well_target == "G8") %>%
+  filter(!well_target == "G10") %>%
+  drop_na("par_ue") %>%
+  ggplot() +
+  ggtitle("Plot of Diaton, CCMP1336") +
+  ylab("Cell Count per ml") +
+  xlab("Elapsed Time (min)") +
+  labs(color = "Dates of Measurement") +
+  geom_point(aes(x = ElapMin, y = cellcount, color = as.factor(datetime))) +
+  scale_y_continuous(trans = "reverse") + #reverses the y-axis
+  facet_grid (cols = vars(par_ue)) +
+  theme_classic()
+
+SinkMetaAll2 %>% 
+  filter(!date_sink == "2021-02-17") %>%
+  filter(strain == "CCMP1335") %>%
+  filter(!well_target == "F3") %>%
+  filter(!well_target == "F6") %>%
+  filter(!well_target =="F5") %>%
+  filter(!well_target == "F8") %>%
+  filter(!well_target == "F10") %>%
+  #filter(par_ue == 300) %>%
+  drop_na("par_ue") %>%
+  ggplot() +
+  ggtitle("Plot of Diaton, CCMP1335") +
+  ylab("Cell Count per ml") +
+  xlab("Elapsed Time (min)") +
+  labs(color = "Dates of Measurement") +
+  theme_classic() +
+  geom_point(aes(x = ElapMin, y = cellcount, color = as.factor(datetime))) +
+  scale_y_continuous(trans = "reverse") #+ #reverses the y-axis
+  facet_grid (cols = vars(par_ue)) 
+  
+
+SinkMetaAll2 %>% 
+  filter(!date_sink == "2021-02-17") %>%
+  filter(strain == "CCMP495") %>%
+  filter(!well_target == "E3") %>%
+  filter(!well_target == "E6") %>%
+  filter(!well_target =="E5") %>%
+  filter(!well_target == "E8") %>%
+  filter(!well_target == "E10") %>%
+  drop_na("par_ue") %>%
+  ggplot() +
+  ggtitle("Plot of Diaton, CCMP495") +
+  ylab("Cell Count per ml") +
+  xlab("Elapsed Time (min)") +
+  labs(color = "Dates of Measurement") +
+  geom_point(aes(x = ElapMin, y = cellcount, color = as.factor(datetime))) +
+  scale_y_continuous(trans = "reverse") + #reverses the y-axis
+  facet_grid (cols = vars(par_ue)) +
+  theme_classic()
+
+
+```
+
+```{r}
+
+# SinkNest <- SinkMetaAll2 %>%
+#   select(date_sink, Elapsed.Time.m, cellcount, well_target, strain, well) %>%
+#   mutate(DateTime = paste(date_sink, Elapsed.Time.m)) %>%
+#   mutate(DateTime = ymd_hms(DateTime)) %>%
+#   drop_na("DateTime") %>%
+#   select(-Elapsed.Time.m) %>%
+#   relocate(DateTime, .before =  cellcount, date_sink, well_target, well, strain)
+# 
+# SinkXTS <-  xts(SinkNest$cellcount, SinkNest$DateTime)
+# SinkTS <- ts(as.numeric(SinkXTS), frequency = 10)
+# 
+#   relocate(DateTime, .before = cellcount) %>%
+#   nest(data = c(DateTime, cellcount)) %>%
+#   mutate(xts_data = map(data, ~as.xts(.x$DateTime)))
+#   mutate(xts_data = map(data, ~xts(order.by =  .x$DateTime))) %>%
+#   mutate(data_ts = map(xts_data, ~ts(as.numeric(.x$xts_data), frequency = 10)))
+
+# SinkBP <- SinkMetaAll2 %>%
+#   mutate(DateTime = paste(date_sink, Elapsed.Time.m)) %>%
+#   mutate(DateTime = ymd_hms(DateTime)) %>%
+#   drop_na("DateTime") %>%
+#   select(-c(CellAverageIntegratedIntensity, CellTotalIntegratedIntensity)) %>%
+#   nest(data = c(ElapMin, cellcount, Elapsed.Time.m, CellAverageIntensity, CellTotalIntensity, TotalCellArea, AverageCellArea, DateTime)) %>%
+#   mutate(fit_bp = map(data, ~breakpoints(cellcount ~ ElapMin, data = ., breaks = 2)),
+#                     param_bp = map(fit_bp, "coefficients"),
+#                     qual_bp = map(fit_bp, "vcov"),
+#                     summary_bp = map(fit_bp, summary))
+# 
+# 
+# SinkChngpt <- SinkMetaAll2 %>%
+#   mutate(DateTime = paste(date_sink, Elapsed.Time.m)) %>%
+#   mutate(DateTime = ymd_hms(DateTime)) %>%
+#   drop_na("DateTime") %>%
+#   select(-c(CellAverageIntegratedIntensity, CellTotalIntegratedIntensity)) %>%
+#   nest(data = c(ElapMin, cellcount, Elapsed.Time.m, CellAverageIntensity, CellTotalIntensity, TotalCellArea, AverageCellArea, DateTime)) %>%
+#   mutate(fit_chngpt = map(data, ~chngptm(formula.1 = cellcount ~ 1, formula.2 = ~ ElapMin, data = ., type = "M22c",  family = "gaussian")),
+#                         param_chngpt = map(fit_chngpt, "coefficients"),
+#                         qual_chngpt = map(fit_chngpt, "vcov"),
+#                         summary_chngpt = map(fit_chngpt, summary))
+
+
+  
+
+test <- SinkMetaAll2 %>% 
+  filter(!date_sink == "2021-02-17") %>%
+  filter(strain == "NIES981") %>%
+  filter(!well_target == "B3") %>%
+  filter(!well_target == "B6") %>%
+  filter(!well_target == "B7") %>%
+  filter(!well_target == "B8") %>%
+  filter(!well_target == "B9") %>%
+  filter(par_ue == 30) %>%
+  #drop_na("FieldOfView_mm2") %>%
+  select(date_sink, Elapsed.Time.m, cellcount) %>%
+  mutate(DateTime = paste(date_sink, Elapsed.Time.m)) %>%
+  mutate(DateTime = ymd_hms(DateTime)) %>%
+  select(-c(Elapsed.Time.m, date_sink)) %>%
+  relocate(DateTime, .before = cellcount) %>%
+  drop_na("DateTime") 
+
+data_xts <- as.xts(test, order.by = test$DateTime)
+data_xts2 <- xts(test$cellcount, test$DateTime)
+data_ts <- ts(as.numeric(data_xts2), frequency = 10)
+
+data("Nile")
+
+fs.CCMP1335 <- Fstats(data_ts ~ 1)
+plot(fs.CCMP1335)
+breakpoints(fs.CCMP1335)
+lines(breakpoints(fs.CCMP1335))
+
+
+bp.CCMP1335 <- breakpoints(data_ts ~ 1)
+summary(bp.CCMP1335)
+
+## the BIC also chooses one breakpoint
+plot(bp.CCMP1335)
+breakpoints(bp.CCMP1335)
+
+
+fm0 <- lm(data_ts ~ 1)
+fm1 <- lm(data_ts ~ breakfactor(bp.CCMP1335, breaks = 1))
+plot(data_ts)
+lines(ts(fitted(fm0)), col = 3)
+lines(ts(fitted(fm1)), col = 4)
+lines(bp.CCMP1335)
+
+## confidence interval
+ci.nile <- confint(bp.CCMP1335)
+ci.nile
+lines(ci.nile)
+```
+

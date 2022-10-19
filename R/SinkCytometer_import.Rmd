@@ -87,7 +87,11 @@ SinkTidy <- SinkFile %>%
 SinkMetaAll <- inner_join(SinkTidy, SinkProt, by = c("well_target", "date_sink", "strain")) %>% 
   rename("TimeID" = "T Id", "well" = "well_source", "cellcount" = "Cell Count", "plate" = "plate_origin", "TotalCellArea" = "Total Area", "AverageCellArea" = "Average Area", "CellTotalIntensity" = "Cell Total Intensity", "CellAverageIntensity" = "Cell Average Intensity", "CellTotalIntegratedIntensity" = "Cell Total Integrated Intensity", "CellAverageIntegratedIntensity" = "Cell Average Integrated Intensity") %>%
   distinct()%>%
-  mutate(ElapMin = TimeID * 10)
+  mutate(ElapSec = TimeID * 10*60,
+         ElapMin = TimeID *10,
+         Elapsed.Time.m = seconds_to_period(ElapSec),
+         test = as.character(Elapsed.Time.m),
+         test2 = format(as.POSIXct(test, format="%HH %MM %SS"), "%H:%M::%S"))
   
 
 
@@ -101,15 +105,18 @@ SinkMetaAll2 <- full_join(SinkMetaAll, MetaData, by = c("strain", "plate", "well
          sink_height_mm = tot_vol_uL/(pi*well_radius_mm^2)) %>%
   group_by(id) %>%
   drop_na(cellcount) %>%
-  mutate(sink_diff = cellcount - cellcount[1])
+  mutate(sink_diff = cellcount - cellcount[1],
+         CellSurface = abs(TotalCellArea-lag(TotalCellArea))/abs(cellcount-lag(cellcount)))
 
 SinkMetaAll2 %>%
-  filter(strain == "CCMP495") %>%
-  ggplot() +
-  geom_line(aes(x = ElapMin, y = (sink_diff), color = as.factor(well))) +
+  #filter(strain == "CCMP495") %>%
+  ggplot(aes(x = ElapMin, y = (cellcount), color = as.factor(datetime))) +
+  geom_point() +
+  geom_smooth(method = "lm", se=FALSE, color="black", formula = y ~ x) +
   facet_grid(
-    #rows = vars(strain), 
+    rows = vars(strain),
     cols = vars(par_ue)) +
+  #ylim(0, 500) +
   theme_classic()
 
 

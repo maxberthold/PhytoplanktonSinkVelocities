@@ -33,6 +33,7 @@ library(zoo)
 library(timetk)
 library(xts)
 library(strucchange)
+library(changepoint)
 library(chngpt)
 library(segmented)
 library(googledrive)
@@ -49,8 +50,54 @@ ImportSink <- readRDS(file = file.path(paste(FP1, DataIn, sep = "/"), paste(Proj
 
 ``` {r}
 SinkAll <- ImportSink %>%
+  group_by(id, date_sink) %>%
+  mutate(cellcount = replace(cellcount, is.na(cellcount), 0), # replace NA with 0, as nothing was detected
+         TotalCellArea = replace(TotalCellArea, is.na(TotalCellArea), 0), # replace NA with 0, as nothing was detected
+         CCAv = rollmean(cellcount, k = 3, fill = NA), #cell count average, k = 3 as moderate smoother, compared to too noisy or to too much filtering
+         TCAreaAv = rollmean(TotalCellArea, k = 3, fill = NA), #total cell area average smooth, k = 3
+         ElapMinAv = rollmean(ElapMin, k = 3, fill = NA), #elapsed minute average smooth, k = 3 to align time with smoothed data
+         CCDiffAv = CCAv - lag(CCAv), # create cell difference between time steps
+         CCDiffAv = replace(CCDiffAv, CCDiffAv < 0, 0), # treat every negative cell difference as 0 == no change to increase positive peak size
+         CellSurfDiffAv = (TCAreaAv-lag(TCAreaAv))/(CCAv-lag(CCAv)), # create change in cell surface area between time points
+         CellSurfDiffAv = replace(CellSurfDiffAv, CellSurfDiffAv < 0, 0), # treat every negative cell surface area difference as 0 == no change to increase positive peak size
+         CellSurfDiffAv = replace(CellSurfDiffAv, is.na(CellSurfDiffAv), 0),
+         CellSurfDiffAv = replace(CellSurfDiffAv, is.infinite(CellSurfDiffAv), 0),
+         CellSurfDiffAv = replace(CellSurfDiffAv, is.nan(CellSurfDiffAv), 0),
+         StNCellSurf = mean(CellSurfDiffAv, na.rm = TRUE)/sd(CellSurfDiffAv, na.rm = TRUE), #signal to noise calculation cell surface difference
+         StNcc = mean(CCDiffAv, na.rm = TRUE)/sd(CCDiffAv, na.rm = TRUE) #signal to noise calculation cell count difference
+         ) #%>%  
   
+SinkAll %>%
+  filter(date_sink == "2022-10-18") %>%
+  #filter(strain %in% c("CCMP495")) %>%
+  filter(id == "MaBe4066") %>%
+  #filter(strain %in% c("PCC6803", "CZS25K", "CCMP836")) %>%
+  ggplot(aes(y = (CCDiffAv), x = ElapMinAv, color = as.factor(well))) +
+  geom_line() +
+  geom_smooth(method = "lm", se=FALSE, color="black", formula = y ~ x) +
+  geom_hline(aes(yintercept = StNcc)) +
+  facet_grid(
+    rows = vars(par_ue),
+    cols = vars(strain)
+    ) +
+  #ylim(0, 1000) +
+  theme_bw()
 
+SinkAll %>%
+  filter(date_sink == "2022-10-18") %>%
+  #filter(strain %in% c("CCMP495")) %>%
+  filter(id == "MaBe4066") %>%
+  #filter(strain %in% c("PCC6803", "CZS25K", "CCMP836")) %>%
+  ggplot(aes(y = (CellSurfDiffAv), x = ElapMinAv, color = as.factor(well))) +
+  geom_line() +
+  geom_smooth(method = "lm", se=FALSE, color="black", formula = y ~ x) +
+  geom_hline(aes(yintercept = StNCellSurf)) +
+  facet_grid(
+    rows = vars(par_ue),
+    cols = vars(strain)
+    ) +
+  #ylim(0, 1000) +
+  theme_bw()
 
 ```
 

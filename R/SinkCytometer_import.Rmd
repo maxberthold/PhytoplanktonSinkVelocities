@@ -14,6 +14,9 @@ Project <- "PhytoSink"
 FP1 <- ".."
 PlotFolder <- "Plots"
 DataIn <- "RawData"
+DataAlive <- "AliveCounts"
+DataDead <- "DeadCounts"
+DataDeadAlive <- "DeadAliveCounts"
 DataOut <- "TidyData"
 FileID <- "sink"
 SkipSink = 0
@@ -59,15 +62,29 @@ SinkProt <- read_sheet("https://docs.google.com/spreadsheets/d/1ya-DkakngUYXZce1
 
 
 ```{r}
-SinkFiles <- list.files(path = paste(FP1, DataIn, sep = "/"), pattern = FileID, full.names = TRUE)
+SinkFilesAlive <- list.files(path = paste(FP1, DataIn, DataAlive, sep = "/"), pattern = FileID, full.names = TRUE)
 
-unique(duplicated(SinkFiles))
+unique(duplicated(SinkFilesAlive))
+
+SinkFilesDead <- list.files(path = paste(FP1, DataIn, DataDead, sep = "/"), pattern = FileID, full.names = TRUE)
+
+unique(duplicated(SinkFilesDead))
+
+SinkFilesDeadAlive <- list.files(path = paste(FP1, DataIn, DataDeadAlive, sep = "/"), pattern = FileID, full.names = TRUE)
+
+unique(duplicated(SinkFilesDeadAlive))
 
 fread_plus <- function(Flnm, Skip, FileEncode, Delim){data.table::fread(file = Flnm, skip = Skip, encoding = FileEncode, sep = Delim, header = TRUE) %>%
     mutate(Filename = Flnm)
 }
 
-SinkFile <- SinkFiles %>%
+SinkFileAlive <- SinkFilesAlive %>%
+  map_df(~fread_plus(Flnm = ., Skip = SkipSink, FileEncode = FileEncodeCS, Delim = DelimCS))
+
+SinkFileDead <- SinkFilesDead %>%
+  map_df(~fread_plus(Flnm = ., Skip = SkipSink, FileEncode = FileEncodeCS, Delim = DelimCS))
+
+SinkFileDeadAlive <- SinkFilesDeadAlive %>%
   map_df(~fread_plus(Flnm = ., Skip = SkipSink, FileEncode = FileEncodeCS, Delim = DelimCS))
     
 ```

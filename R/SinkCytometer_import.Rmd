@@ -79,38 +79,60 @@ fread_plus <- function(Flnm, Skip, FileEncode, Delim){data.table::fread(file = F
 }
 
 SinkFileAlive <- SinkFilesAlive %>%
-  map_df(~fread_plus(Flnm = ., Skip = SkipSink, FileEncode = FileEncodeCS, Delim = DelimCS))
+  map_df(~fread_plus(Flnm = ., Skip = SkipSink, FileEncode = FileEncodeCS, Delim = DelimCS)) %>% # Alive data set shows area and intensity of all Cy5-respondent cells; DeadAlive shows this information only for DeadAlive (Positive) cells
+  rename("well_target" = "Well Name", "Cy5CellCount" = "Cell Count", "Cy5CTotInt" = "Cell Total Intensity", "Cy5CAvInt" = "Cell Average Intensity", "Cy5CTotAvIntegInt" = "Cell Average Integrated Intensity", "Cy5CTotIntegInt" = "Cell Total Integrated Intensity", "Cy5TotArea" = "Total Area", "Cy5AvArea" = "Average Area")
 
-SinkFileDead <- SinkFilesDead %>%
-  map_df(~fread_plus(Flnm = ., Skip = SkipSink, FileEncode = FileEncodeCS, Delim = DelimCS))
+SinkFileDead <- SinkFilesDead %>% 
+  map_df(~fread_plus(Flnm = ., Skip = SkipSink, FileEncode = FileEncodeCS, Delim = DelimCS)) %>% # DeadAlive analyses only covers cells which are either alive Cy5 or show double-staining Cy5 + TexasRed; 
+  rename("well_target" = "Well Name", "DeadCC" = "Cell Count", "DeadCTotInt" = "Cell Total Intensity", "DeadCAvInt" = "Cell Average Intensity", "DeadCTotAvIntegInt" = "Cell Average Integrated Intensity", "DeadCTotIntegInt" = "Cell Total Integrated Intensity", "DeadTotArea" = "Total Area", "DeadAvArea" = "Average Area")
 
 SinkFileDeadAlive <- SinkFilesDeadAlive %>%
-  map_df(~fread_plus(Flnm = ., Skip = SkipSink, FileEncode = FileEncodeCS, Delim = DelimCS))
+  map_df(~fread_plus(Flnm = ., Skip = SkipSink, FileEncode = FileEncodeCS, Delim = DelimCS)) %>% # Dead analyses shows all TexasRed emitting cells 
+  rename("well_target" = "Well Name", "TotCy5Cells" = "# Cells", "DeadAliveCells" = "# Positive Cells", "ShareDeadAliveCells" = "% Positive Cells", "AliveCells" = "# Negative Cells", "ShareAliveCells" = "% Negative Cells", "DeadAliveCAvInt" = "Positive Cell Average Intensities", "TotCy5CellAvInt" = "All Cell Average Intensities", "DeadAliveCTotInt" = "Positive Cell Total Intensity", "DeadAliveCTotArea" = "Positive Cell Total Area", "DeadAliveCAvArea" = "Positive Cell Average Area", "DeadAliveCIntegInt" = "Positive Cell Integrated Intensities", "DeadAliveCTotIntegInt" = "Positive Cell Total Integrated Intensity")
     
 ```
 
 #Data insertion and joining of various dataframes:
 
 ```{r}
-
-SinkTidy <- SinkFile %>%
-  separate(col = Filename, into = c("fp1", "fp2", "fp3", "DataIn", "datetime", "Project", "Exp", "plate", "FromPlate", "ToPlate", "strain", "Descr",  "csv"), sep = "([\\/\\_\\.\\:])", remove = FALSE) %>%
-  dplyr::select(-c(fp1, DataIn, csv, Project, FromPlate, ToPlate, plate,fp2, fp3, Descr, Filename)) %>%
+SinkTidyAlive <- SinkFileAlive %>%
+  separate(col = Filename, into = c("fp1", "fp2", "fp3", "DataIn","Marker",  "datetime", "Project", "Exp", "plate", "FromPlate", "ToPlate", "strain", "Descr",  "csv"), sep = "([\\/\\_\\.\\:])", remove = FALSE) %>%
+  dplyr::select(-c(fp1, DataIn, csv, Project, FromPlate, ToPlate, plate,fp2, fp3, Descr, Filename, Marker)) %>%
   mutate(datetime = ymd_hm(datetime)) %>%
   separate(datetime, into = c("date_sink", "time_sink"), sep = " ", remove = FALSE) %>%
   mutate(date_sink = ymd(date_sink), time_sink = hms(time_sink)) %>%
-  purrr::keep(~!all(is.na(.))) %>%
-  rename("well_target" = "Well Name")
+  purrr::keep(~!all(is.na(.))) 
 
+
+SinkTidyDead <- SinkFileDead %>%
+  separate(col = Filename, into = c("fp1", "fp2", "fp3", "DataIn","Marker",  "datetime", "Project", "Exp", "plate", "FromPlate", "ToPlate", "strain", "Descr",  "csv"), sep = "([\\/\\_\\.\\:])", remove = FALSE) %>%
+  dplyr::select(-c(fp1, DataIn, csv, Project, FromPlate, ToPlate, plate,fp2, fp3, Descr, Filename, Marker)) %>%
+  mutate(datetime = ymd_hm(datetime)) %>%
+  separate(datetime, into = c("date_sink", "time_sink"), sep = " ", remove = FALSE) %>%
+  mutate(date_sink = ymd(date_sink), time_sink = hms(time_sink)) %>%
+  purrr::keep(~!all(is.na(.))) 
+  
+
+SinkTidyDeadAlive <- SinkFileDeadAlive %>%
+  separate(col = Filename, into = c("fp1", "fp2", "fp3", "DataIn","Marker",  "datetime", "Project", "Exp", "plate", "FromPlate", "ToPlate", "strain", "Descr",  "csv"), sep = "([\\/\\_\\.\\:])", remove = FALSE) %>%
+  dplyr::select(-c(fp1, DataIn, csv, Project, FromPlate, ToPlate, plate,fp2, fp3, Descr, Filename, Marker)) %>%
+  mutate(datetime = ymd_hm(datetime)) %>%
+  separate(datetime, into = c("date_sink", "time_sink"), sep = " ", remove = FALSE) %>%
+  mutate(date_sink = ymd(date_sink), time_sink = hms(time_sink)) %>%
+  purrr::keep(~!all(is.na(.))) 
+
+SinkTidy <- full_join(SinkTidyAlive, SinkTidyDead)%>%
+  full_join(SinkTidyDeadAlive, by = c("T Id", "well_target", "datetime", "date_sink", "time_sink", "Exp", "strain")) 
 
 
 SinkMetaAll <- inner_join(SinkTidy, SinkProt, by = c("well_target", "date_sink", "strain")) %>% 
-  rename("TimeID" = "T Id", "well" = "well_source", "cellcount" = "Cell Count", "plate" = "plate_origin", "TotalCellArea" = "Total Area", "AverageCellArea" = "Average Area", "CellTotalIntensity" = "Cell Total Intensity", "CellAverageIntensity" = "Cell Average Intensity", "CellTotalIntegratedIntensity" = "Cell Total Integrated Intensity", "CellAverageIntegratedIntensity" = "Cell Average Integrated Intensity") %>%
+  rename("TimeID" = "T Id", "well" = "well_source",  "plate" = "plate_origin") %>%
   distinct() %>%
   mutate(ElapSec = TimeID * 10*60,
          ElapMin = TimeID *10, 
          ElapHour = ElapMin / 60,
-         Elapsed.Time.m = strftime(as.POSIXct(ElapHour * 60 * 60 , origin = date_sink), format = "%H:%M:%S")) #shows time format with 20 hour offset
+         Elapsed.Time.m = strftime(as.POSIXct(ElapHour * 60 * 60 , origin = date_sink), format = "%H:%M:%S"), #shows time format with 20 hour offset
+         DiffCy5_DeadAlive = Cy5CellCount - TotCy5Cells) 
   
 
 
@@ -121,7 +143,8 @@ SinkMetaAll2 <- full_join(SinkMetaAll, MetaData, by = c("strain", "plate", "well
   group_by(strain, plate) %>% mutate(ElapDay = as.numeric((datetime - exp_date[1])/24)) %>% ungroup() %>%
   mutate(well_radius_mm = case_when(plate_type == "Greiner655090" ~ 3.29),
          tot_vol_uL = added_culture_uL + media_vol_uL,
-         sink_height_mm = tot_vol_uL/(pi*well_radius_mm^2)) 
+         sink_height_mm = tot_vol_uL/(pi*well_radius_mm^2)
+         ) 
 
 saveRDS(SinkMetaAll2, file.path(paste(FP1, DataOut, sep = "/"),
 paste(Project, FileID, "PicoData.Rds", sep = "_"), fsep = .Platform$file.sep))

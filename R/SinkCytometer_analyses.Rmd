@@ -104,6 +104,25 @@ SinkAvShort <- MetaData %>%
          ) %>%
   arrange(GroupID)
 
+CellSurfPlot <- SinkAvShort %>%
+  #filter(strain %in% Cyano) %>%
+  ggplot(aes(y = log(CellSurfDiffAv), x = ElapMinAv, color = as.factor(date_sink))) +
+  geom_point() +
+  #geom_point(aes(y = (CCDiffNoNoise), x = ElapMinAv, color = "red")) +
+  geom_smooth(method = "lm", se=FALSE, color="black", formula = y ~ x) +
+  #geom_vline(aes(xintercept = CCDiffNoNoise)) +
+  #geom_vline(aes(xintercept = BrkTime, color = as.factor(date_sink))) +
+  facet_grid(
+    rows = vars(par_ue)
+    ,cols = vars(strain)
+    ) +
+  coord_cartesian(xlim = c(0, 610)
+                  #, ylim = c(0, 16)
+                  ) +
+  theme_bw()
+ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, "CellSurfaceTrend_SinkAvPlot.png", sep = "_"), fsep = .Platform$file.sep), plot = CellSurfPlot, height = 10, width = 12)
+
+
 opt_bpts <- function(x) {
   #x = bpts_sum$RSS["BIC",]
   n <- length(x)
@@ -172,7 +191,7 @@ Brk_Compare <- full_join(SinkAvShort, df_brkpt) %>%
 #MinFilter <- 120
 Y_var <- "CellSurfDiffAv" # TCAreaDiffAv CellSurfDiffAv CCDiffAv
 Cyano <- c("PCC6803", "CZS25K", "CCMP836") #c("CCMP495", "CCMP1335", "CCMP1336")
-Diatom <- c("CCMP495")#, "CCMP1335", "CCMP1336")
+Diatom <- c("CCMP495")# , "CCMP1335", "CCMP1336") #, "CCMP1335", "CCMP1336")
   
 CyanoSinkAll <- Brk_Compare %>%
   #filter(date_sink == "2022-10-16") %>%
@@ -180,7 +199,7 @@ CyanoSinkAll <- Brk_Compare %>%
          Y_var > 0) %>%
   #filter(ElapMinAv < MinFilter) %>%
   ggplot() +
-  geom_point(aes(y = (!!sym(Y_var)), x = ElapMinAv, color = as.factor(date_sink))) +
+  geom_line(aes(y = (!!sym(Y_var)), x = ElapMinAv, color = as.factor(date_sink))) +
   #geom_point(aes(y = (CCDiffNoNoise), x = ElapMinAv, color = "red")) +
   #geom_smooth(method = "lm", se=FALSE, color="black", formula = y ~ x) +
   #geom_vline(aes(xintercept = CCDiffNoNoise)) +
@@ -190,7 +209,7 @@ CyanoSinkAll <- Brk_Compare %>%
     cols = vars(strain)
     ) +
   coord_cartesian(xlim = c(0, 610)
-                  , ylim = c(0, 16)
+  #                , ylim = c(0, 16)
                   ) +
   theme_bw()
 CyanoSinkAll

@@ -128,9 +128,9 @@ SinkTidy <- full_join(SinkTidyAlive, SinkTidyDead)%>%
 SinkMetaAll <- inner_join(SinkTidy, SinkProt, by = c("well_target", "date_sink", "strain")) %>% 
   rename("TimeID" = "T Id", "well" = "well_source",  "plate" = "plate_origin") %>%
   distinct() %>%
-  mutate(ElapSec = TimeID * 10*60,
-         ElapMin = TimeID *10, 
-         ElapHour = ElapMin / 60,
+  mutate(ElapMin = (TimeID * 10)-5, #TimeIDs are 10 min apart and ID 1 is the very first measurement (0 min), but it took ~2 - 4 minutes to load each plate prior analyses, though *10 - 5 corrects for loadings, but includes the 10 min interval
+         ElapSec = ElapMin * 60,
+         ElapHour = ElapMin / 60, 
          Elapsed.Time.m = strftime(as.POSIXct(ElapHour * 60 * 60 , origin = date_sink), format = "%H:%M:%S"), #shows time format with 20 hour offset
          DiffCy5_DeadAlive = Cy5CellCount - TotCy5Cells) 
   
@@ -143,8 +143,8 @@ SinkMetaAll2 <- full_join(SinkMetaAll, MetaData, by = c("strain", "plate", "well
   group_by(strain, plate) %>% mutate(ElapDay = as.numeric((datetime - exp_date[1])/24)) %>% ungroup() %>%
   mutate(well_radius_mm = case_when(plate_type == "Greiner655090" ~ 3.29),
          tot_vol_uL = added_culture_uL + media_vol_uL,
-         sink_height_mm = tot_vol_uL/(pi*well_radius_mm^2)
-         ) 
+         sink_height_mm = tot_vol_uL/(pi*well_radius_mm^2),
+         CorrDeadCells = DeadCC - DeadAliveCells) 
 
 saveRDS(SinkMetaAll2, file.path(paste(FP1, DataOut, sep = "/"),
 paste(Project, FileID, "PicoData.Rds", sep = "_"), fsep = .Platform$file.sep))

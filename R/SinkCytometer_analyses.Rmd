@@ -29,16 +29,17 @@ library(stringr)
 library(broom)
 library(knitr)
 library(OneR)
-library(zoo)
+library(zoo) #creation of time series objects
 library(timetk)
-library(xts)
-library(strucchange)
-library(changepoint)
-library(chngpt)
-library(segmented)
+library(xts) #creation of time series objects
+library(strucchange) #breakpoint analyses
+library(changepoint) #changepoint analyses
+library(chngpt) #changepoint analyses
+library(segmented) #breakpoint analyses
 library(googledrive)
 library(googlesheets4)
 library(rhdf5)
+#library(signal) #package containing Savitzky-Golay smoothing filter
   
 ```
 
@@ -46,57 +47,172 @@ library(rhdf5)
 
 ``` {r data import}
 
-ImportSink <- readRDS(file = file.path(paste(FP1, DataIn, sep = "/"), paste(Project, FileID, "PicoData.Rds", sep  = "_"),fsep = .Platform$file.sep))
+ImportSink <- readRDS(file = file.path(paste(FP1, DataIn, sep = "/"), paste(Project, FileID, "PicoData.Rds", sep  = "_"),fsep = .Platform$file.sep)) 
 MetaData <- read_sheet("https://docs.google.com/spreadsheets/d/1jBRuKWXGL9MDtD3e_NGhhrhWPrB0OdJ8XmJRKQrg0Oo/edit#gid=0")
 SinkProt <- read_sheet("https://docs.google.com/spreadsheets/d/1ya-DkakngUYXZce1Ty0l2oX5AvULkLLayoCAgkSexRs/edit?pli=1#gid=0") %>%
   mutate(date_sink = ymd(date_sink))
 
 ```
 
-``` {r averaged replicates, warning = FALSE}
 
-SinkReplTotAreaAv <- ImportSink %>%
-  group_by(strain, date_sink, datetime, par_ue, ElapMin, TimeID) %>%
-  mutate(ReplicateNo = cur_group_id(), 
-         TotalCellArea = replace(TotalCellArea, is.na(TotalCellArea), 0) # replace NA with 0, as nothing was detected
+``` {r wholesome individual approach, warning = FALSE}
+
+
+
+SinkMeta <- MetaData %>%
+  full_join(SinkProt, by = c("id" = "culture_ID", "strain" = "strain", "plate" = "plate_origin", "well" ="well_source")) %>%
+  select(-c(id, well, well_target, PropidiumIod_vol_uL)) %>%#unselect Propidium iodide here, as there was a pipetting error once! Calculate true cellcount before that step!!!
+  mutate(exp_date = ymd(exp_date))
+  
+SinkCC <- ImportSink %>%
+  select(strain, date_sink, datetime, par_ue, ElapMin, TimeID, well, well_target, CorrDeadCells, AliveCells, DeadAliveCells) %>%
+  full_join(SinkMeta) %>%
+  distinct() %>%
+   group_by(strain, date_sink, par_ue, well) %>%
+  dplyr::filter(date_sink != "2022-10-20") %>% #data for 20th October currently lost, filter for empty entry
+  drop_na(project_id) %>%
+      mutate(sink_hour = datetime + minutes(ElapMin),
+         sink_hour = replace(sink_hour, is.na(sink_hour), datetime)
          ) %>%
-  group_by(ReplicateNo, strain, date_sink, datetime, par_ue, ElapMin, TimeID) %>%
-  summarise(TotalCellArea_repl = mean(TotalCellArea, na.rm = TRUE)) 
+  pivot_longer(cols = c(CorrDeadCells, AliveCells, DeadAliveCells), names_to = "Viability", values_to = "Cellcount") %>%
+  group_by(strain, date_sink, par_ue, well, Viability) %>%
+  mutate(GroupID = cur_group_id()) %>%
+  arrange(GroupID) 
+
+
+opt_bpts <- function(x) { #function to determine optimal amount of breaking points in a time series
+  #x = bpts_sum$RSS["BIC",]
+  n <- length(x)
+  lowest <- vector("logical", length = n-1)
+  lowest[1] <- FALSE
+  for (i in 2:n) {
+    lowest[i] <- x[i] < x[i-1] & x[i] < x[i+1]
+  }
+  out <- as.integer(names(x)[lowest])
+  return(out)
+} #https://www.marinedatascience.co/blog/2019/09/28/comparison-of-change-point-detection-methods/
+
+
+SinkBreak <- SinkCC %>%
+  ungroup() %>%
+  mutate(Cellcount = replace(Cellcount, is.na(Cellcount), 0)) %>%# replace NAs in Cellcount with 0 just for breakpoint analyses
+  select(GroupID, Cellcount, sink_hour) %>%
+  group_by(GroupID) %>%
+  nest() %>%
+  mutate(ts = map(.x = data, 
+                  .f = tk_ts, 
+                  select = -sink_hour),
+         bp_ts = map(ts, ~breakpoints(formula = Cellcount ~ 1, data = .)),
+         bpts_sum = map(bp_ts, ~summary(.x)),
+         opt_brks = map(bpts_sum, ~opt_bpts(.x$RSS["BIC",]))) %>%
+  unnest_wider(opt_brks) %>%
+  rename("opt_brks" = "...1") %>%
+  mutate(opt_brks = replace(opt_brks, is.na(opt_brks), 0))
+
+  
+Mbrk = matrix(data = NA, nrow = nrow(SinkBreak), ncol = 6)
+
+for (i in 1:nrow(SinkBreak)){
+  Mbrk[i,1] = i # column 1 is Group ID
+}
+
+
+  for (i in 1:nrow(SinkBreak)){
+      for (j in 1:length(SinkBreak[[4]][[i]][["breakpoints"]])) {
+        Mbrk[i,j+1] <- SinkBreak[[4]][[i]][["breakpoints"]][[j]]
+      }
+  } #for-loop code by Rahel
+
+df_brkpt <- as.data.frame(Mbrk) %>%
+  rename("GroupID" = "V1", "Brkpt_1" = "V2", "Brkpt_2" = "V3", "Brkpt_3" = "V4", "Brkpt_4" = "V5", "Brkpt_5" = "V6") %>% 
+  pivot_longer(cols = c(Brkpt_1:Brkpt_5), values_to = "TimeID", names_to = "BrkptNo") 
+
+
+
+Brk_Compare <- full_join(SinkCC, df_brkpt) %>%
+  arrange(GroupID) %>%
+  separate(BrkptNo, into = c("Brkpt", "BrkptNo"), sep = "_") %>%
+  mutate(BrkTime = case_when(BrkptNo != "NA" ~ ElapMin*1),
+         BrkTime = replace(BrkTime, is.na(BrkTime), 0),
+         BrkptNo = as.numeric(BrkptNo)) %>%
+  fill(BrkptNo, .direction = "up") %>%
+  
+
+         ,
+         CCDiffNoNoise = case_when(CCDiffAv <= StNcc ~ 0,
+                                   CCDiffAv > StNcc ~ (CCDiffAv*1)
+                                   ),
+         CCDiffNoNoise = replace(CCDiffNoNoise, CCDiffNoNoise == 0, NA),
+         tot_vol_uL = added_culture_uL + media_vol_uL,
+         well_radius_mm = case_when(plate_type == "Greiner655090" ~ 3.29),
+         sink_height_mm = tot_vol_uL/(pi*well_radius_mm^2),
+         sink_vel_mm_min = sink_height_mm/BrkTime)
+
+```
+
+
+
+``` {r averaged replicates, warning = FALSE}
 
 SinkReplCCAv <- ImportSink %>%
   group_by(strain, date_sink,datetime, par_ue, ElapMin, TimeID) %>%
   mutate(ReplicateNo = cur_group_id(), 
-         cellcount = replace(cellcount, is.na(cellcount), 0) # replace NA with 0, as nothing was detected
+         DeadAliveCells = replace(DeadAliveCells, is.na(DeadAliveCells), 0),
+         AliveCells = replace(AliveCells, is.na(AliveCells), 0),# replace NA with 0, as nothing was detected
+         CorrDeadCells = replace(CorrDeadCells, is.na(CorrDeadCells), 0)
          ) %>%
   group_by(ReplicateNo, strain, date_sink, datetime, par_ue, ElapMin, TimeID) %>%
-  summarise(cellcount_repl = mean(cellcount, na.rm = TRUE)) 
+  summarise(DeadAliveCC_repl = mean(DeadAliveCells, na.rm = TRUE),
+            AliveCC_repl = mean(AliveCells, na.rm = TRUE),
+            DeadCC_repl = mean(CorrDeadCells, na.rm = TRUE)
+            ) 
 
-SinkReplAv <- full_join(SinkReplCCAv, SinkReplTotAreaAv) 
-  
 SinkAvShort <- MetaData %>%
   full_join(SinkProt, by = c("id" = "culture_ID", "strain" = "strain", "plate" = "plate_origin", "well" ="well_source")) %>%
   select(-c(id, well, well_target, PropidiumIod_vol_uL)) %>% #unselect Propidium iodide here, as there was a pipetting error once! Calculate true cellcount before that step!!!
-  full_join(SinkReplAv) %>%
+  full_join(SinkReplCCAv) %>%
   distinct() %>%
   group_by(strain, date_sink, par_ue) %>%
-  mutate(CCAv = rollmean(cellcount_repl, k = 3, fill = NA), #cell count average, k = 3 as moderate smoother, compared to too noisy or to too much filtering
-         TCAreaAv = rollmean(TotalCellArea_repl, k = 3, fill = NA), #total cell area average smooth, k = 3
-         ElapMinAv = rollmean(ElapMin, k = 3, fill = NA), #elapsed minute average smooth, k = 3 to align time with smoothed data
-         CCDiffAv = CCAv - lag(CCAv), # create cell difference between time steps
-         CCDiffAv = replace(CCDiffAv, CCDiffAv < 0, 0), # treat every negative cell difference as 0 == no change to increase positive peak size
-         CCDiffAv = replace(CCDiffAv, is.na(CCDiffAv), 0),
-         CellSurfDiffAv = (TCAreaAv-lag(TCAreaAv))/(CCAv-lag(CCAv)), # create change in cell surface area between time points
-         CellSurfDiffAv = replace(CellSurfDiffAv, CellSurfDiffAv < 0, 0), # treat every negative cell surface area difference as 0 == no change to increase positive peak size
-         CellSurfDiffAv = replace(CellSurfDiffAv, is.na(CellSurfDiffAv), 0),
-         CellSurfDiffAv = replace(CellSurfDiffAv, is.infinite(CellSurfDiffAv), 0),
-         CellSurfDiffAv = replace(CellSurfDiffAv, is.nan(CellSurfDiffAv), 0),
-         TCAreaDiffAv = (TCAreaAv-lag(TCAreaAv)), # create change in cell surface area between time points
-         TCAreaDiffAv = replace(TCAreaDiffAv, TCAreaDiffAv < 0, 0), # treat every negative cell surface area difference as 0 == no change to increase positive peak size
-         TCAreaDiffAv = replace(TCAreaDiffAv, is.na(TCAreaDiffAv), 0),
-         StNCellSurf = mean(CellSurfDiffAv, na.rm = TRUE)/sd(CellSurfDiffAv, na.rm = TRUE), #signal to noise calculation cell surface difference
-         StNcc = mean(CCDiffAv, na.rm = TRUE)/sd(CCDiffAv, na.rm = TRUE) #signal to noise calculation cell count difference
+  mutate(ColonySink = case_when(ElapMin < 120 ~ "Colony",
+                                ElapMin > 120 ~ "PostColony"),
+         AliveCCStep = cummax(AliveCC_repl),
+         DeadCCStep = cummax(DeadCC_repl),
+         DeadAliveCCStep = cummax(DeadAliveCC_repl), #https://stackoverflow.com/questions/64029692/ifelse-replace-value-if-it-is-lower-than-previous
+         AliveDiff = AliveCCStep - lag(AliveCCStep),
+         DeadDiff = DeadCCStep - lag(DeadCCStep), 
+         DeadAliveDiff = DeadAliveCCStep - lag(DeadAliveCCStep)
          ) %>%  
-  filter(date_sink != "2022-10-20") %>% #data for 20th October currently lost, filter for empty entry
+  dplyr::filter(date_sink != "2022-10-20")  %>% #data for 20th October currently lost, filter for empty entry
+  drop_na(project_id) %>%
+      mutate(sink_hour = datetime + minutes(ElapMin),
+             GroupID = cur_group_id(),
+             sink_hour = replace(sink_hour, is.na(sink_hour), datetime)
+         ) %>%
+  arrange(GroupID)
+
+
+
+SinkAvShort <- MetaData %>%
+  full_join(SinkProt, by = c("id" = "culture_ID", "strain" = "strain", "plate" = "plate_origin", "well" ="well_source")) %>%
+  select(-c(id, well, well_target, PropidiumIod_vol_uL)) %>% #unselect Propidium iodide here, as there was a pipetting error once! Calculate true cellcount before that step!!!
+  full_join(SinkReplCCAv) %>%
+  distinct() %>%
+  group_by(strain, date_sink, par_ue) %>%
+  mutate(ElapMinAv = rollmean(ElapMin, k = 3, fill = NA), #elapsed minute average smooth, k = 3 to align time with smoothed data
+         DeadAliveCCAv = rollmean(DeadAliveCC_repl, k = 3, fill = NA), #cell count average, k = 3 as moderate smoother, compared to too noisy or to too much filtering
+         DeadAliveDiffAv = DeadAliveCCAv - lag(DeadAliveCCAv), # create cell difference between time steps
+         DeadAliveDiffAv = replace(DeadAliveDiffAv, DeadAliveDiffAv < 0, 0), # treat every negative cell difference as 0 == no change to increase positive peak size
+         DeadAliveDiffAv = replace(DeadAliveDiffAv, is.na(DeadAliveDiffAv), 0),
+         AliveCCAv = rollmean(AliveCC_repl, k = 3, fill = NA), 
+         AliveDiffAv = AliveCCAv - lag(AliveCCAv), 
+         AliveDiffAv = replace(AliveDiffAv, AliveDiffAv < 0, 0), 
+         AliveDiffAv = replace(AliveDiffAv, is.na(AliveDiffAv), 0),
+         DeadCCAv = rollmean(DeadCC_repl, k = 3, fill = NA), 
+         DeadDiffAv = DeadCCAv - lag(DeadCCAv), 
+         DeadDiffAv = replace(DeadDiffAv, DeadDiffAv < 0, 0), 
+         DeadDiffAv = replace(DeadDiffAv, is.na(DeadDiffAv), 0)
+         ) %>%  
+  dplyr::filter(date_sink != "2022-10-20") %>% #data for 20th October currently lost, filter for empty entry
   drop_na(project_id) %>%
       mutate(sink_hour = datetime + minutes(ElapMinAv),
          GroupID = cur_group_id(),
@@ -104,23 +220,10 @@ SinkAvShort <- MetaData %>%
          ) %>%
   arrange(GroupID)
 
-CellSurfPlot <- SinkAvShort %>%
-  #filter(strain %in% Cyano) %>%
-  ggplot(aes(y = log(CellSurfDiffAv), x = ElapMinAv, color = as.factor(date_sink))) +
-  geom_point() +
-  #geom_point(aes(y = (CCDiffNoNoise), x = ElapMinAv, color = "red")) +
-  geom_smooth(method = "lm", se=FALSE, color="black", formula = y ~ x) +
-  #geom_vline(aes(xintercept = CCDiffNoNoise)) +
-  #geom_vline(aes(xintercept = BrkTime, color = as.factor(date_sink))) +
-  facet_grid(
-    rows = vars(par_ue)
-    ,cols = vars(strain)
-    ) +
-  coord_cartesian(xlim = c(0, 610)
-                  #, ylim = c(0, 16)
-                  ) +
-  theme_bw()
-ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, "CellSurfaceTrend_SinkAvPlot.png", sep = "_"), fsep = .Platform$file.sep), plot = CellSurfPlot, height = 10, width = 12)
+Cyano <- c("PCC6803", "CZS25K", "CCMP836") #c("CCMP495", "CCMP1335", "CCMP1336")
+Diatom <- c("CCMP495", "CCMP1335", "CCMP1336") #, "CCMP1335", "CCMP1336")
+
+
 
 
 opt_bpts <- function(x) {
@@ -191,22 +294,23 @@ Brk_Compare <- full_join(SinkAvShort, df_brkpt) %>%
 #MinFilter <- 120
 Y_var <- "CellSurfDiffAv" # TCAreaDiffAv CellSurfDiffAv CCDiffAv
 Cyano <- c("PCC6803", "CZS25K", "CCMP836") #c("CCMP495", "CCMP1335", "CCMP1336")
-Diatom <- c("CCMP495")# , "CCMP1335", "CCMP1336") #, "CCMP1335", "CCMP1336")
+Diatom <- c("CCMP495" , "CCMP1335", "CCMP1336") #, "CCMP1335", "CCMP1336")
   
 CyanoSinkAll <- Brk_Compare %>%
-  #filter(date_sink == "2022-10-16") %>%
-  filter(strain %in% Diatom, 
-         Y_var > 0) %>%
+  filter(Viability == "AliveCells") %>%
+  filter(strain %in% "CCMP495", 
+         #Y_var > 0
+         ) %>%
   #filter(ElapMinAv < MinFilter) %>%
   ggplot() +
-  geom_line(aes(y = (!!sym(Y_var)), x = ElapMinAv, color = as.factor(date_sink))) +
+  geom_line(aes(y = (Cellcount), x = ElapMin)) +
   #geom_point(aes(y = (CCDiffNoNoise), x = ElapMinAv, color = "red")) +
   #geom_smooth(method = "lm", se=FALSE, color="black", formula = y ~ x) +
   #geom_vline(aes(xintercept = CCDiffNoNoise)) +
-  geom_vline(aes(xintercept = BrkTime, color = as.factor(date_sink))) +
+  geom_vline(aes(xintercept = BrkTime, color = as.factor(BrkptNo))) +
   facet_grid(
     rows = vars(par_ue),
-    cols = vars(strain)
+    cols = vars(date_sink)
     ) +
   coord_cartesian(xlim = c(0, 610)
   #                , ylim = c(0, 16)
@@ -237,8 +341,101 @@ BrkSink <- Brk_Compare %>%
 BrkSink
 
 ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, "BreakingPointAll_SinkAvPlot.png", sep = "_"), fsep = .Platform$file.sep), plot = BrkSink, height = 10, width = 12)
+Strain <- "PCC6803"
+test <- SinkAvShort %>%
+  group_by(GroupID, ColonySink) %>%
+  mutate(AliveDiffSD = sd(AliveDiff, na.rm = TRUE),
+         AliveDiffStNFlag = if_else(AliveDiff >= 2*AliveDiffSD , 1, 0),
+         DeadDiffSD = sd(DeadDiff, na.rm = TRUE),
+         DeadDiffStNFlag = if_else(DeadDiff >= 2*DeadDiffSD , 1, 0),
+         DeadAliveDiffSD = sd(DeadAliveDiff, na.rm = TRUE),
+         DeadAliveDiffStNFlag = if_else(DeadAliveDiff >= 2*DeadAliveDiffSD , 1, 0),
+         AliveMax = if_else(AliveDiff >= 2*AliveDiffSD, AliveDiff, 0),
+         DeadMax = if_else(DeadDiff >= 2*DeadDiffSD, DeadDiff, 0),
+         DeadAliveMax = if_else(DeadAliveDiff >= 2*DeadAliveDiffSD, DeadAliveDiff, 0),
+         Number = ave(AliveMax, FUN = function(G){
+  G*(cumsum(G == 0) + (G[1] == 1))
+  }),
+  DeadRatio = DeadAliveCC_repl/AliveCC_repl
+      ) %>%
+  #        ) %>% 
+  # filter(AliveMax != 0, 
+  #        strain %in% Diatom) %>%
+  # drop_na(AliveMax) 
+  dplyr::filter( 
+         #AliveDiffStNFlag == 1,
+         # DeadDiffStNFlag == 1,
+         # DeadAliveDiffStNFlag == 1,
+         strain %in% Strain,
+         date_sink != "2022-10-14"
+                                    #https://stackoverflow.com/questions/67028230/assign-group-numbers-within-ids-to-rows-separated-by-zeros
+         ) %>%
+  ggplot(aes(y = AliveCC_repl, x = ElapMin, color = "Alive")) +
+  geom_line() +
+  # geom_line(aes(y = (DeadAliveCC_repl), x = ElapMin, color = "DeadAlive")) +
+  # geom_line(aes(y = (DeadCC_repl), x = ElapMin, color = "Dead")) +
+  #geom_point(aes(y = (CCDiffNoNoise), x = ElapMinAv, color = "red")) +
+  #geom_smooth(method = "lm", se=FALSE, color="black", formula = y ~ x) +
+  #geom_hline(aes(yintercept = 2*AliveDiffSD, color = as.factor(ColonySink))) +
+  #geom_vline(aes(xintercept = 120)) +
+  xlab(bquote("Elapsed time (minutes)")) + 
+  ylab(bquote('Cell count (Alive)')) +
+  guides(color = guide_legend(title = "Synechocystis sp.")) +
+  scale_y_continuous(sec.axis = sec_axis(~ . , name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_x_continuous(sec.axis = sec_axis(~ . , name = "Sink date and time", breaks = NULL, labels = NULL)) +
+  facet_grid(
+    rows = vars(par_ue)
+    ,cols = vars(date_sink)
+    ) +
+  coord_cartesian(xlim = c(0, 610)
+                  #, ylim = c(0, 16)
+                  ) +
+  theme_bw()
+test
+ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, Strain, "CellSinkAlive.png", sep = "_"), fsep = .Platform$file.sep), plot = test, height = 10, width = 12)
+
+
+CellSurfPlot <- SinkAvShort %>%
+  group_by(GroupID, ColonySink) %>%
+  mutate(AliveDiffSD = sd(AliveDiff, na.rm = TRUE),
+         AliveDiffStNFlag = if_else(AliveDiff >= 2*AliveDiffSD , 1, 0),
+         DeadDiffSD = sd(DeadDiff, na.rm = TRUE),
+         DeadDiffStNFlag = if_else(DeadDiff >= 2*DeadDiffSD , 1, 0),
+         DeadAliveDiffSD = sd(DeadAliveDiff, na.rm = TRUE),
+         DeadAliveDiffStNFlag = if_else(DeadAliveDiff >= 2*DeadAliveDiffSD , 1, 0)
+         ) %>%
+  dplyr::filter( 
+         #AliveDiffStNFlag == 1,
+         # DeadDiffStNFlag == 1,
+         # DeadAliveDiffStNFlag == 1,
+         strain %in% "CCMP495",
+         #date_sink != "2022-10-14"
+                                    #https://stackoverflow.com/questions/67028230/assign-group-numbers-within-ids-to-rows-separated-by-zeros
+         ) %>%
+  ggplot(aes(y = (AliveCC_repl), x = ElapMin, color = "Alive")) +
+  geom_line() +
+  geom_line(aes(y = (DeadCC_repl), x = ElapMin, color = "Dead")) +
+  geom_line(aes(y = (DeadAliveCC_repl), x = ElapMin, color = "DeadAlive")) +
+  #geom_point(aes(y = (CCDiffNoNoise), x = ElapMinAv, color = "red")) +
+  #geom_smooth(method = "lm", se=FALSE, color="black", formula = y ~ x) +
+  geom_hline(aes(yintercept = 2*AliveDiffSD, color = as.factor(ColonySink))) +
+  geom_vline(aes(xintercept = 120)) +
+  facet_grid(
+    rows = vars(par_ue)
+    ,cols = vars(date_sink)
+    ) +
+  coord_cartesian(xlim = c(0, 610)
+                  #, ylim = c(0, 16)
+                  ) +
+  theme_bw()
+CellSurfPlot
+
+
+
+ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, "CellSurfaceTrend_SinkAvPlot.png", sep = "_"), fsep = .Platform$file.sep), plot = CellSurfPlot, height = 10, width = 12)
 
 ```
+
 
 ``` {r post-colony sinking}
 TS_brks <- SinkAvShort %>%
@@ -430,6 +627,18 @@ ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Projec
 
 
 ``` {r Grabbelkiste}
+
+CellSurfDiffAv = (TCAreaAv-lag(TCAreaAv))/(CCAv-lag(CCAv)), # create change in cell surface area between time points
+         CellSurfDiffAv = replace(CellSurfDiffAv, CellSurfDiffAv < 0, 0), # treat every negative cell surface area difference as 0 == no change to increase positive peak size
+         CellSurfDiffAv = replace(CellSurfDiffAv, is.na(CellSurfDiffAv), 0),
+         CellSurfDiffAv = replace(CellSurfDiffAv, is.infinite(CellSurfDiffAv), 0),
+         CellSurfDiffAv = replace(CellSurfDiffAv, is.nan(CellSurfDiffAv), 0),
+         TCAreaDiffAv = (TCAreaAv-lag(TCAreaAv)), # create change in cell surface area between time points
+         TCAreaDiffAv = replace(TCAreaDiffAv, TCAreaDiffAv < 0, 0), # treat every negative cell surface area difference as 0 == no change to increase positive peak size
+         TCAreaDiffAv = replace(TCAreaDiffAv, is.na(TCAreaDiffAv), 0),
+         StNCellSurf = mean(CellSurfDiffAv, na.rm = TRUE)/sd(CellSurfDiffAv, na.rm = TRUE), #signal to noise calculation cell surface difference
+         StNcc = mean(CCDiffAv, na.rm = TRUE)/sd(CCDiffAv, na.rm = TRUE) #signal to noise calculation cell count difference
+
 # TS_test <- SinkAll %>%
 #   ungroup() %>%
 #   select(GroupID, CCDiffAv, sink_hour) %>%
@@ -437,6 +646,15 @@ ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Projec
 #   arrange(GroupID) %>%
 #   group_by(GroupID) %>% nest() #%>%
 #   mutate(TS_chngpt = map(data, ~cpt.meanvar(data = ., method = "PELT", Q = .$data["opt_brks",])))
+
+SinkReplTotAreaAv <- ImportSink %>%
+  group_by(strain, date_sink, datetime, par_ue, ElapMin, TimeID) %>%
+  mutate(ReplicateNo = cur_group_id(), 
+         TotalCellArea = replace(TotalCellArea, is.na(TotalCellArea), 0) # replace NA with 0, as nothing was detected
+         ) %>%
+  group_by(ReplicateNo, strain, date_sink, datetime, par_ue, ElapMin, TimeID) %>%
+  summarise(TotalCellArea_repl = mean(TotalCellArea, na.rm = TRUE)
+            ) 
 
 p1 <- SinkAll %>%
   filter(date_sink == "2022-10-18") %>%
@@ -627,12 +845,13 @@ TStest <- SinkMetaAll2 %>%
          CellSurface = replace(CellSurface, is.nan(CellSurface), 0)
   )
 
-# ExportToy <- SinkMetaAll2 %>%
-#   filter(date_sink == "2022-10-18",
-#          id %in% c("MaBe4065")) %>%
-#   select(ElapMin, cellcount)
-# 
-# h5write(ExportToy, "ExportToy_sink.h5", name = "RawData")
+ExportToy <- SinkReplCCAv %>%
+  dplyr::filter(date_sink == "2022-10-18",
+         strain == "CZS25K",
+         par_ue == 100) %>%
+  select(ElapMin, DeadCC_repl, AliveCC_repl, DeadAliveCC_repl)
+
+h5write(ExportToy, "ExportToy_sink.h5", name = "CZS25K")
 
 plot(as.ts(decompose_beer$seasonal))
 plot(as.ts(decompose_beer$trend))

@@ -39,6 +39,9 @@ library(segmented) #breakpoint analyses
 library(googledrive)
 library(googlesheets4)
 library(rhdf5)
+library(minpack.lm)
+library(nlstools)
+library(nlsMicrobio)
 #library(signal) #package containing Savitzky-Golay smoothing filter
   
 ```
@@ -56,25 +59,29 @@ SinkProt <- read_sheet("https://docs.google.com/spreadsheets/d/1ya-DkakngUYXZce1
 
 
 ``` {r wholesome individual approach, warning = FALSE}
-
+CapArea_mm2 <- 0.48 #captured area based on MD Pico software
+RelTotArea <- 0.0141 #relative area per well in percent based on MD Pico software
+TotArea_mm2 <- CapArea_mm2/RelTotArea
 
 
 SinkMeta <- MetaData %>%
   full_join(SinkProt, by = c("id" = "culture_ID", "strain" = "strain", "plate" = "plate_origin", "well" ="well_source")) %>%
-  select(-c(id, well, well_target, PropidiumIod_vol_uL)) %>%#unselect Propidium iodide here, as there was a pipetting error once! Calculate true cellcount before that step!!!
+  select(-c(id, well, well_target, PropidiumIod_vol_uL)) %>% #unselect Propidium iodide here, as there was a pipetting error once! Calculate true cellcount before that step!!!
   mutate(exp_date = ymd(exp_date))
   
 SinkCC <- ImportSink %>%
-  select(strain, date_sink, datetime, par_ue, ElapMin, TimeID, well, well_target, CorrDeadCells, AliveCells, DeadAliveCells) %>%
+  select(strain, date_sink, datetime, par_ue, ElapMin, TimeID, well, well_target, CorrDeadCells, AliveCells, DeadAliveCells, TotCy5Cells, culture_vol_uL, PropidiumIod_vol_uL) %>%
   full_join(SinkMeta) %>%
   distinct() %>%
-   group_by(strain, date_sink, par_ue, well) %>%
+  group_by(strain, date_sink, par_ue, well) %>%
   dplyr::filter(date_sink != "2022-10-20") %>% #data for 20th October currently lost, filter for empty entry
   drop_na(project_id) %>%
-      mutate(sink_hour = datetime + minutes(ElapMin),
+  mutate(
+         sink_hour = datetime + minutes(ElapMin),
          sink_hour = replace(sink_hour, is.na(sink_hour), datetime)
          ) %>%
-  pivot_longer(cols = c(CorrDeadCells, AliveCells, DeadAliveCells), names_to = "Viability", values_to = "Cellcount") %>%
+  pivot_longer(cols = c(CorrDeadCells, AliveCells, DeadAliveCells, TotCy5Cells), names_to = "Viability", values_to = "Cellcount") %>%
+  mutate(Cellcount_L = ((Cellcount/CapArea_mm2)*TotArea_mm2)*100000/(PropidiumIod_vol_uL/culture_vol_uL)) %>% #CellCount per L, 10 µL added each time represents cells per 10 µL times 100 000 per L; factor PropidiumIod/culture_vol represents dilution before start of the experiment
   group_by(strain, date_sink, par_ue, well, Viability) %>%
   mutate(GroupID = cur_group_id()) %>%
   arrange(GroupID) 
@@ -95,14 +102,14 @@ opt_bpts <- function(x) { #function to determine optimal amount of breaking poin
 
 SinkBreak <- SinkCC %>%
   ungroup() %>%
-  mutate(Cellcount = replace(Cellcount, is.na(Cellcount), 0)) %>%# replace NAs in Cellcount with 0 just for breakpoint analyses
-  select(GroupID, Cellcount, sink_hour) %>%
+  mutate(Cellcount_L = replace(Cellcount_L, is.na(Cellcount_L), 0)) %>%# replace NAs in Cellcount_L with 0 just for breakpoint analyses
+  select(GroupID, Cellcount_L, sink_hour) %>%
   group_by(GroupID) %>%
   nest() %>%
   mutate(ts = map(.x = data, 
                   .f = tk_ts, 
                   select = -sink_hour),
-         bp_ts = map(ts, ~breakpoints(formula = Cellcount ~ 1, data = .)),
+         bp_ts = map(ts, ~breakpoints(formula = Cellcount_L ~ 1, data = .)),
          bpts_sum = map(bp_ts, ~summary(.x)),
          opt_brks = map(bpts_sum, ~opt_bpts(.x$RSS["BIC",]))) %>%
   unnest_wider(opt_brks) %>%
@@ -123,30 +130,502 @@ for (i in 1:nrow(SinkBreak)){
       }
   } #for-loop code by Rahel
 
+impute.mean <- function(x) replace(x, is.na(x), mean(x, na.rm = TRUE)) #https://stackoverflow.com/questions/9322773/how-to-replace-na-with-mean-by-group-subset
+
 df_brkpt <- as.data.frame(Mbrk) %>%
   rename("GroupID" = "V1", "Brkpt_1" = "V2", "Brkpt_2" = "V3", "Brkpt_3" = "V4", "Brkpt_4" = "V5", "Brkpt_5" = "V6") %>% 
   pivot_longer(cols = c(Brkpt_1:Brkpt_5), values_to = "TimeID", names_to = "BrkptNo") 
 
+df_strain <- SinkCC %>%
+  ungroup() %>%
+  select(Viability, GroupID, strain, date_sink, par_ue) %>%
+  distinct()
 
+impute_brkpt1 <- full_join(df_brkpt, df_strain) %>%
+  group_by(Viability, par_ue, strain) %>%
+  filter(BrkptNo == "Brkpt_1") %>%
+  mutate(
+         TimeID = if_else(is.na(TimeID), impute.mean(TimeID), TimeID),
+         Brkpt1Av = mean(TimeID),
+         TimeID = if_else(TimeID >= 1.5*Brkpt1Av, Brkpt1Av, TimeID),
+         TimeID = round(TimeID)
+         ) %>%
+  select(-Brkpt1Av)
 
-Brk_Compare <- full_join(SinkCC, df_brkpt) %>%
+impute_brkpt <- full_join(df_brkpt, df_strain) %>%
+  group_by(Viability, par_ue, strain) %>%
+  filter(BrkptNo != "Brkpt_1") %>%
+  rbind(impute_brkpt1) %>%
+  arrange(GroupID,BrkptNo)
+
+Brk_Compare <- full_join(SinkCC, impute_brkpt) %>%
+  group_by(GroupID, Viability) %>%
   arrange(GroupID) %>%
   separate(BrkptNo, into = c("Brkpt", "BrkptNo"), sep = "_") %>%
   mutate(BrkTime = case_when(BrkptNo != "NA" ~ ElapMin*1),
          BrkTime = replace(BrkTime, is.na(BrkTime), 0),
          BrkptNo = as.numeric(BrkptNo)) %>%
   fill(BrkptNo, .direction = "up") %>%
-  
-
-         ,
-         CCDiffNoNoise = case_when(CCDiffAv <= StNcc ~ 0,
-                                   CCDiffAv > StNcc ~ (CCDiffAv*1)
-                                   ),
-         CCDiffNoNoise = replace(CCDiffNoNoise, CCDiffNoNoise == 0, NA),
+  mutate(Cellcount = replace(Cellcount, is.na(Cellcount), 0), # replace NA with 0, as nothing was detected
+         CellcountStep = cummax(Cellcount), #https://stackoverflow.com/questions/64029692/ifelse-replace-value-if-it-is-lower-than-previous
+         CellcountDiff = CellcountStep - lag(CellcountStep),
+         BrkptNo = if_else(BrkptNo > 1, 2, 1)) %>% #sort breaking points into pre-colony sinking breakpoint-period 1, and post-colony as breakpoint-period 2 
+  group_by(strain, GroupID, Viability, BrkptNo) %>% #explicitly group to calculate peak-filter based on peak height twice standard deviation
+  mutate(CellcountDiffSD = sd(CellcountDiff, na.rm = TRUE),
+         CellcountDiffSDFlag = if_else(CellcountDiff >= 2*CellcountDiffSD, 1, 0),
+         CellcountMax = if_else(CellcountDiff >= 2*CellcountDiffSD, as.numeric(CellcountDiff), 0),
+         BrkTime_test = if_else(CellcountMax > 0, ElapMin, BrkTime),
          tot_vol_uL = added_culture_uL + media_vol_uL,
          well_radius_mm = case_when(plate_type == "Greiner655090" ~ 3.29),
          sink_height_mm = tot_vol_uL/(pi*well_radius_mm^2),
-         sink_vel_mm_min = sink_height_mm/BrkTime)
+         sink_vel_mm_min = sink_height_mm/BrkTime_test
+         )
+         
+BrkSink <- Brk_Compare %>%
+  filter(
+         #strain == "CCMP1335",
+         sink_vel_mm_min != Inf,
+         CellcountDiffSDFlag != 0,
+         BrkptNo == 1,
+         Viability == "AliveCells",
+         sink_vel_mm_min < 0.4
+         ) %>%
+  drop_na(BrkptNo) %>%
+  #        #BrkptNo == "Brkpt_1") %>%
+  ggplot(aes(y = sink_vel_mm_min, x = sink_hour, color = as.factor(well))) +
+  geom_point() +
+  #geom_line(aes(y = sink_vel_mm_min, x = sink_hour, color = as.factor(well))) +
+  #geom_point(aes(y = (CCDiffNoNoise), x = ElapMinAv, color = "red")) +
+  #geom_smooth(method = "loess", se=FALSE, color="black", formula = y ~ x) +
+  #geom_vline(aes(xintercept = CCDiffNoNoise)) +
+  #geom_vline(aes(xintercept = BrkTime_test, color = as.factor(date_sink))) +
+  facet_grid(
+     rows = vars(strain),
+    cols = vars(par_ue)
+    ) +
+  coord_cartesian(
+    #xlim = c(0, 0.4)
+                   ylim = c(0, 0.5)
+                   ) +
+  theme_bw()
+BrkSink
+
+SinkSizeTotArea <- ImportSink %>%
+  select(date_sink, TimeID, well_target, well, strain, par_ue, Cy5TotArea, DeadTotArea, DeadAliveCTotArea) %>%
+  rename("AliveCells" = 'Cy5TotArea', 'CorrDeadCells' = 'DeadTotArea', 'DeadAliveCells' = 'DeadAliveCTotArea') %>%
+  pivot_longer(cols = c(AliveCells, CorrDeadCells, DeadAliveCells), names_to = "Viability", values_to = "TotCellArea")
+
+SinkSize <- ImportSink %>%
+  select(date_sink, TimeID, well_target, well, strain, par_ue, Cy5AvArea, DeadAvArea, DeadAliveCAvArea) %>%
+  rename("AliveCells" = 'Cy5AvArea', 'CorrDeadCells' = 'DeadAvArea', 'DeadAliveCells' = 'DeadAliveCAvArea') %>%
+  pivot_longer(cols = c(AliveCells, CorrDeadCells, DeadAliveCells), names_to = "Viability", values_to = "AvCellArea") %>%
+  full_join(SinkSizeTotArea) %>%
+  mutate(AvCellArea = replace(AvCellArea, is.na(AvCellArea), 0),
+         TotCellArea = replace(TotCellArea, is.na(TotCellArea), 0)) %>%
+  full_join(Brk_Compare) %>%
+  group_by(date_sink, Viability, strain, par_ue, well) %>%
+  mutate(CellcountDiff = replace(CellcountDiff, is.na(CellcountDiff), 0),
+         CellcountDiff = if_else(CellcountDiff > lag(CellcountDiff), as.numeric(CellcountDiff), 0),
+         TotCellArea = if_else(TotCellArea > lag(TotCellArea), as.numeric(TotCellArea), 0),
+         AvCellSurfDiff = (TotCellArea - lag(TotCellArea))/(CellcountDiff - lag(CellcountDiff)),  #create change in cell surface area between time points
+         AvCellSurfDiff = replace(AvCellSurfDiff, is.na(AvCellSurfDiff), 0),
+         AvCellSurfDiff = replace(AvCellSurfDiff, is.infinite(AvCellSurfDiff), 0),
+         AvCellSurfDiff = replace(AvCellSurfDiff, is.nan(AvCellSurfDiff), 0),
+         CellRadius = (2*(sqrt(AvCellSurfDiff/pi)))
+         ) %>%
+  filter(AvCellSurfDiff > 0)
+
+
+SinkSizePlot <- SinkSize %>% 
+  filter(
+         #strain == "CCMP836",
+         CellRadius < 100,
+         sink_vel_mm_min != Inf,
+         CellcountDiffSDFlag != 0,
+         #par_ue == 30,
+         #date_sink == "2022-10-17",
+         #well == 'A2'
+         #CellAreaScale >= 0,
+         #CellAreaScale <= 1,
+         BrkptNo == 1,
+         #Viability == "CorrDeadCells",
+         #sink_vel_mm_min < 0.4
+         ) %>%
+  #drop_na(BrkptNo) #%>%
+  #        #BrkptNo == "Brkpt_1") %>%
+  ggplot(aes(y = (sink_vel_mm_min), x = (CellRadius), color = as.factor(strain))) +
+  geom_point() +
+ #  geom_point(aes(y = sink_vel_mm_min/100, color = "SinkVeloc"), data = SinkSize) +
+ #  scale_y_continuous(
+ # # labels = number_format(scale = 1e-3),
+ #  sec.axis = sec_axis(trans = ~ .x / 100
+ #                      )) +
+  geom_smooth(method = "lm",  formula = y ~ 0 + x, se=TRUE, color = "black") +
+  facet_grid(
+     rows = vars(Viability),
+    cols = vars(par_ue)
+    ) + 
+  #ylim(0, 1000) +
+  theme_bw()
+SinkSizePlot
+
+ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, "CellRadius", "SinkVeloPlot.png", sep = "_"), fsep = .Platform$file.sep), plot = SinkSizePlot, height = 10, width = 12)
+# ExportSize <- SinkSize %>%
+#   dplyr::filter(
+#          strain %in% c("CCMP1335")
+#          ) %>%
+#   select(ElapMin, Viability, par_ue, strain, sink_hour, date_sink, AvCellArea, TotCellArea, Cellcount, well, sink_vel_mm_min)
+# 
+# h5write(ExportSize, "ExportSize_sink.h5", name = "CCMP1335")
+
+```
+
+
+``` {r growth rates based on cell counts}
+#grouping variables for rows & columns, and for nesting for fitting
+RowVar <- "par_ue" 
+RowVar2 <- "date_sink"
+ColVar <- "strain"
+ColVar2 <- "Viability"
+FitVar <- "Cellcount_L"
+
+
+GrowthCC <- SinkCC %>%
+  group_by(GroupID, date_sink, strain, par_ue, Viability, well, datetime) %>%
+  filter(Cellcount_L == max(Cellcount_L, na.rm = TRUE)) %>%
+  distinct(GroupID, Cellcount_L) %>%
+  full_join(MetaData) %>% 
+  ungroup() %>%
+  mutate(strain = as.factor(strain)) %>%
+  group_by(strain, well, par_ue) %>%
+  mutate(logFitVarminFitVar = log(!!sym(FitVar)/min(!!sym(FitVar), na.rm = TRUE)), 
+         E_hours = as.numeric((datetime - datetime[1])/3600),
+         E_days = as.numeric((datetime - datetime[1])/86400),
+         logFitVarminFitVar = replace(logFitVarminFitVar, is.infinite(logFitVarminFitVar), NA)
+         ) %>%
+  group_by(!!sym(RowVar), !!sym(ColVar), !!sym(ColVar2), well) %>%
+  mutate(LagSeed = E_days[which.min(!!sym(FitVar))])
+
+GrowthCC %>%
+  #filter(strain %in% "CZS25K") %>%
+  filter(Viability %in% "CorrDeadCells") %>%
+  #filter(exp_date == "20200902") %>%
+  #filter(tissue_treated_plate == TissueTreated) %>%
+  #filter(media == Media) %>%
+  #filter(SourceSal == source_salinity) %>%
+  ggplot()+
+  geom_point(aes(x = E_days, y = log(!!sym(FitVar)), colour = as.factor(well), shape = as.factor(!!sym(ColVar2)))) +
+  geom_line(aes(x = E_days, y = log(!!sym(FitVar)), colour = as.factor(well), shape = as.factor(!!sym(ColVar2)))) +
+  #coord_cartesian(ylim = c(0, 2)) +
+  facet_grid(cols = vars(!!sym(ColVar)), rows = vars(!!sym(RowVar))) +
+  theme_bw() 
+
+#Define equations as functions.
+#x will be taken from 'E_days' when we run the fit.
+LogisticEqn <-  function(x, Pmax, Mu, Intercept){(Pmax*Intercept*exp(Mu*x))/(Pmax + (Intercept*(exp(Mu*x)-1)))
+}
+
+ModGompertzEqn <- function(x, Gmax,Gmu,Lag){(Gmax*(exp(-exp((Gmu*exp(1))/Gmax*(Lag-x)+1))))}
+
+possibnlSLM = possibly(.f = nlsLM, otherwise = NULL)
+
+#run nesting by passing in values of variables set at top; 
+#!!sym(... allows nest to access the characters of the values passed in
+GrowthNestSpecific <- GrowthCC %>%
+  nest(data = -c(!!sym(RowVar), !!sym(ColVar), !!sym(ColVar2), well, LagSeed))
+
+
+
+#extract nest-specific start, lower & upper setting by passing in "."
+CellMuSpecific <- GrowthNestSpecific %>% 
+    mutate(
+  FitLog = map(data, ~possibnlSLM(!!sym(FitVar) ~ LogisticEqn(x = E_days, Intercept, Mu, Pmax),
+                            data = .x, 
+                            start = list(
+                              Intercept = min(.[,FitVar], na.rm = TRUE), 
+                              Mu = (log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days), 
+                              Pmax = max(.[,FitVar], na.rm = TRUE)),
+                            control = list(maxiter = 1000)
+                            ,
+                            lower = c((min(.[,FitVar], na.rm = TRUE) * 0.05),
+                                      ((log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days)) *0.05,
+                                      ((max(.[,FitVar], na.rm = TRUE)) * 0.05)),
+                            upper = c((min(.[,FitVar], na.rm = TRUE) * 10000),
+                                      ((log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days)) * 10000,
+                                      ((max(.[,FitVar], na.rm = TRUE)) * 10000))
+               )
+                ),
+  PredictLog = map(FitLog, augment),
+  TidiedLog = map(FitLog, tidy),
+  ParamLog = map(FitLog, glance)
+  ) %>%
+   mutate(
+    FitGompertz = (map(data, ~possibnlSLM(logFitVarminFitVar ~ ModGompertzEqn(x = E_days, Lag, Gmu, Gmax),
+                                    data = .x,
+                                    start = list(Lag = LagSeed, Gmu = (log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days), Gmax = max(.[, "logFitVarminFitVar"], na.rm = TRUE)),
+                                    control = list(maxiter = 1000)
+                            ,
+                                    lower = c(0, ((log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days)) * 0.05, max(.[, "logFitVarminFitVar"], na.rm = TRUE) * 0.05),
+                                    upper = c(1000, ((log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days)) * 10000, max(.[, "logFitVarminFitVar"], na.rm = TRUE) * 10000)))),
+    PredictGompertz = map(FitGompertz, augment),
+    TidiedGompertz = map(FitGompertz, tidy),
+    ParamGompertz = map (FitGompertz, glance))
+
+CellLogSpecificPredict <- CellMuSpecific %>%
+  unnest(PredictLog)
+
+CellLogSpecificCoeff <- CellMuSpecific %>% 
+  unnest(TidiedLog) %>%
+  dplyr::select(c(!!sym(RowVar), !!sym(ColVar), !!sym(ColVar2), well, term:p.value)) 
+
+CellGompertzSpecificPredict <- CellMuSpecific %>%
+  unnest(PredictGompertz)
+
+CellGompertzSpecificCoeff <- CellMuSpecific %>% 
+  unnest(TidiedGompertz) %>%
+  dplyr::select(c(!!sym(RowVar), !!sym(ColVar), !!sym(ColVar2), well, term:p.value)) 
+
+CellLogSpecificPlot <- CellLogSpecificPredict %>% 
+  ggplot() +  
+  geom_line(aes(x = E_days, y = log(.fitted), color = as.factor(Viability)), size = 0.5) +
+  geom_point(aes(x = E_days, y = log(!!sym(FitVar)), color = as.factor(Viability)), size = 0.6) +
+  # geom_ribbon(aes(x = E_days, ymin = (.fitted - .resid), ymax = (.fitted + .resid), alpha = 0.1),show.legend = FALSE) +
+  facet_grid(cols = vars(strain), rows = vars(par_ue)) +
+  theme_bw() #+
+  #theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.text = element_text(colour = "black")) +
+  #labs(y = expression(paste("log(OD"[`680 nm`]*"/min OD"[`680 nm`]*")")), x = "Elapsed time (h)", title = "Treatment Growth, Modified Gompertz with Lag", subtitle = paste(str_c(Strains, collapse = "_"), str_c(StartDate, collapse = "_")))
+  # labs(y = FitVar,
+  #      title = "Treatment Growth, Specific Log",
+  #      subtitle = paste(nm_filter, "nm", str_c(Strains, collapse = "_"), str_c(StartDate, collapse = "_")),
+  #       legend.position="top",
+  #     legend.text=element_text(size=20),
+  #     legend.title =element_text(size=20),
+  #      caption = "Log")
+
+CellLogSpecificPlot
+
+CellGompertzLagSpecificPlot <- CellGompertzSpecificPredict %>% 
+  ggplot() +  
+  geom_line(aes(x = E_days, y = .fitted, color = as.factor(Viability)), size = 0.5) +
+  geom_point(aes(x = E_days, y = logFitVarminFitVar, color = as.factor(Viability)), size = 0.6) +
+  # geom_ribbon(aes(x = E_days, ymin = (.fitted - .resid), ymax = (.fitted + .resid), alpha = 0.1),show.legend = FALSE) +
+  facet_grid(cols = vars(strain), rows = vars(par_ue)) +
+  theme_bw() 
+  #theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.text = element_text(colour = "black")) +
+  #labs(y = expression(paste("log(Cells"[`750 nm`]*"/min Cells"[`750 nm`]*")")), x = "Elapsed time (d)", title = "Modified Gompertz with Lag") +
+  #scale_y_continuous(sec.axis = sec_axis(~ . , name = "Growth level (µmol " ~ m^-2 ~s^-1~" )", breaks = seq(0,10, by=5), labels = NULL))+
+  # theme( legend.position="top",
+  #     legend.text=element_text(size=20),
+  #     legend.title =element_text(size=20),
+  #     axis.text.x=element_text(angle=30, hjust = 1, size=7))
+  # labs(y = FitVar,
+  #      #title = "Treatment Growth, Modified Gompertz Specific with Lag",
+  #      subtitle = paste(nm_filter, "nm", str_c(Strains, collapse = "_"), str_c(StartDate, collapse = "_")),
+  #      #caption = "Modified Gompertz with Lag Line"
+  #      )
+
+CellGompertzLagSpecificPlot
+
+CellLogSpecificCoeff %>% 
+  filter(term == "Mu") %>%
+  ggplot() +  
+  #geom_line(aes(x = par_ue, y = estimate, color = as.factor(well)), size = 0.5) +
+  geom_point(aes(x = par_ue, y = estimate, color = as.factor(well)), size = 1) +
+  # geom_ribbon(aes(x = E_days, ymin = (.fitted - .resid), ymax = (.fitted + .resid), alpha = 0.1),show.legend = FALSE) +
+  facet_grid(cols = vars(strain), rows = vars(Viability)) +
+  ylim(0, 3) +
+  theme_bw() 
+
+```
+
+
+
+``` {r growth rate based on Chlorophyll extraction} 
+#grouping variables for rows & columns, and for nesting for fitting
+RowVar <- "par_ue" 
+RowVar2 <- "date_sink"
+ColVar <- "strain"
+FitVar <- "Chl_ugL_mean"
+
+ChloroGoogle <- "https://docs.google.com/spreadsheets/d/1OaOGZe5qMB_C0b82PTQMRRC0EbRwAH3RCsdYObSfQ7c/edit#gid=0"
+gs4_deauth()
+ChloroData <- read_sheet(ChloroGoogle)
+
+ChlFluor <- ChloroData %>%
+  mutate(ChlDateTime = ymd_hms(paste(DATE, TIME))) %>%
+  rename(date_sink = DATE, ObsTime = TIME, id = CultureID) %>%
+  mutate(date_sink = ymd(date_sink)) %>%
+  mutate(Chl_dil = (Reading_rfu - Chl_intercept)/Chl_slope,
+         Chl_ugL = Chl_dil * ((SolventVol_ul + SampleVol_ul)/SampleVol_ul)) %>%
+  group_by(id, date_sink) %>%
+  summarize (Chl_ugL_mean = mean(Chl_ugL, na.rm = TRUE), .groups = "keep") %>%
+  ungroup() %>%
+  filter(Chl_ugL_mean > 0) %>%
+  full_join(MetaData, by = c("id" = "id")) %>% 
+  drop_na(Chl_ugL_mean, project_id)
+ChlFluor
+
+
+ChlFluor %>%
+  #filter(strain %in% "CZS25K") %>%
+  #filter(exp_date == "20200902") %>%
+  #filter(tissue_treated_plate == TissueTreated) %>%
+  #filter(media == Media) %>%
+  #filter(SourceSal == source_salinity) %>%
+  ggplot()+
+  geom_point(aes(x = date_sink, y = Chl_ugL_mean, colour = as.factor(well))) +
+  geom_line(aes(x = date_sink, y = Chl_ugL_mean, colour = as.factor(well))) +
+  #coord_cartesian(ylim = c(0, 2)) +
+  facet_grid(cols = vars(strain), rows = vars(par_ue)) +
+  theme_bw() 
+
+GrowthCellChl <- full_join(ChlFluor, GrowthCC) %>%
+  group_by(!!sym(RowVar), !!sym(ColVar),  well) %>%
+  mutate(LagSeed = E_days[which.min(!!sym(FitVar))]) %>%
+  filter(Viability == "TotCy5Cells") #track growth based on all Chl-fluorescing cells, dead or DeadAlive
+ 
+#Define equations as functions.
+#x will be taken from 'E_days' when we run the fit.
+LogisticEqn <-  function(x, Pmax, Mu, Intercept){(Pmax*Intercept*exp(Mu*x))/(Pmax + (Intercept*(exp(Mu*x)-1)))
+}
+
+ModGompertzEqn <- function(x, Gmax,Gmu,Lag){(Gmax*(exp(-exp((Gmu*exp(1))/Gmax*(Lag-x)+1))))}
+
+possibnlSLM = possibly(.f = nlsLM, otherwise = NULL)
+
+#run nesting by passing in values of variables set at top; 
+#!!sym(... allows nest to access the characters of the values passed in
+ChlNestSpecific <- GrowthCellChl %>%
+  nest(data = -c(!!sym(RowVar), !!sym(ColVar), well, LagSeed))
+
+
+
+#extract nest-specific start, lower & upper setting by passing in "."
+ChlMuSpecific <- ChlNestSpecific %>% 
+    mutate(
+  FitLog = map(data, ~possibnlSLM(!!sym(FitVar) ~ LogisticEqn(x = E_days, Intercept, Mu, Pmax),
+                            data = .x, 
+                            start = list(
+                              Intercept = min(.[,FitVar], na.rm = TRUE), 
+                              Mu = (log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days), 
+                              Pmax = max(.[,FitVar], na.rm = TRUE)),
+                            control = list(maxiter = 1000)
+                            ,
+                            lower = c((min(.[,FitVar], na.rm = TRUE) * 0.05),
+                                      ((log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days)) *0.05,
+                                      ((max(.[,FitVar], na.rm = TRUE)) * 0.05)),
+                            upper = c((min(.[,FitVar], na.rm = TRUE) * 10000),
+                                      ((log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days)) * 10000,
+                                      ((max(.[,FitVar], na.rm = TRUE)) * 10000))
+               )
+                ),
+  PredictLog = map(FitLog, augment),
+  TidiedLog = map(FitLog, tidy),
+  ParamLog = map(FitLog, glance)
+  ) %>%
+   mutate(
+    FitGompertz = (map(data, ~possibnlSLM(logFitVarminFitVar ~ ModGompertzEqn(x = E_days, Lag, Gmu, Gmax),
+                                    data = .x,
+                                    start = list(Lag = LagSeed, Gmu = (log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days), Gmax = max(.[, "logFitVarminFitVar"], na.rm = TRUE)),
+                                    control = list(maxiter = 1000)
+                            ,
+                                    lower = c(0, ((log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days)) * 0.05, max(.[, "logFitVarminFitVar"], na.rm = TRUE) * 0.05),
+                                    upper = c(1000, ((log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days)) * 10000, max(.[, "logFitVarminFitVar"], na.rm = TRUE) * 10000)))),
+    PredictGompertz = map(FitGompertz, augment),
+    TidiedGompertz = map(FitGompertz, tidy),
+    ParamGompertz = map (FitGompertz, glance))
+
+ChlLogSpecificPredict <- ChlMuSpecific %>%
+  unnest(PredictLog)
+
+ChlLogSpecificCoeff <- ChlMuSpecific %>% 
+  unnest(TidiedLog) %>%
+  dplyr::select(c(!!sym(RowVar), !!sym(ColVar),  well, term:p.value)) 
+
+ChlGompertzSpecificPredict <- ChlMuSpecific %>%
+  unnest(PredictGompertz)
+
+ChlGompertzSpecificCoeff <- ChlMuSpecific %>% 
+  unnest(TidiedGompertz) %>%
+  dplyr::select(c(!!sym(RowVar), !!sym(ColVar),  well, term:p.value)) 
+
+ChlLogSpecificPlot <- ChlLogSpecificPredict %>% 
+  ggplot() +  
+  geom_line(aes(x = E_days, y = log(.fitted), color = as.factor(well)), size = 0.5) +
+  geom_point(aes(x = E_days, y = log(!!sym(FitVar)), color = as.factor(well)), size = 0.6) +
+  # geom_ribbon(aes(x = E_days, ymin = (.fitted - .resid), ymax = (.fitted + .resid), alpha = 0.1),show.legend = FALSE) +
+  facet_grid(cols = vars(strain), rows = vars(par_ue)) +
+  theme_bw() #+
+  #theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.text = element_text(colour = "black")) +
+  #labs(y = expression(paste("log(OD"[`680 nm`]*"/min OD"[`680 nm`]*")")), x = "Elapsed time (h)", title = "Treatment Growth, Modified Gompertz with Lag", subtitle = paste(str_c(Strains, collapse = "_"), str_c(StartDate, collapse = "_")))
+  # labs(y = FitVar,
+  #      title = "Treatment Growth, Specific Log",
+  #      subtitle = paste(nm_filter, "nm", str_c(Strains, collapse = "_"), str_c(StartDate, collapse = "_")),
+  #       legend.position="top",
+  #     legend.text=element_text(size=20),
+  #     legend.title =element_text(size=20),
+  #      caption = "Log")
+
+ChlLogSpecificPlot
+
+ChlGompertzLagSpecificPlot <- ChlGompertzSpecificPredict %>% 
+  ggplot() +  
+  geom_line(aes(x = E_days, y = .fitted, color = as.factor(well)), size = 0.5) +
+  geom_point(aes(x = E_days, y = logFitVarminFitVar, color = as.factor(well)), size = 0.6) +
+  # geom_ribbon(aes(x = E_days, ymin = (.fitted - .resid), ymax = (.fitted + .resid), alpha = 0.1),show.legend = FALSE) +
+  facet_grid(cols = vars(strain), rows = vars(par_ue)) +
+  theme_bw() 
+  #theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.text = element_text(colour = "black")) +
+  #labs(y = expression(paste("log(Cells"[`750 nm`]*"/min Cells"[`750 nm`]*")")), x = "Elapsed time (d)", title = "Modified Gompertz with Lag") +
+  #scale_y_continuous(sec.axis = sec_axis(~ . , name = "Growth level (µmol " ~ m^-2 ~s^-1~" )", breaks = seq(0,10, by=5), labels = NULL))+
+  # theme( legend.position="top",
+  #     legend.text=element_text(size=20),
+  #     legend.title =element_text(size=20),
+  #     axis.text.x=element_text(angle=30, hjust = 1, size=7))
+  # labs(y = FitVar,
+  #      #title = "Treatment Growth, Modified Gompertz Specific with Lag",
+  #      subtitle = paste(nm_filter, "nm", str_c(Strains, collapse = "_"), str_c(StartDate, collapse = "_")),
+  #      #caption = "Modified Gompertz with Lag Line"
+  #      )
+
+ChlGompertzLagSpecificPlot
+
+ChlLogSpecificCoeff %>% 
+  filter(term == "Mu") %>%
+  ggplot() +  
+  #geom_line(aes(x = par_ue, y = estimate, color = as.factor(well)), size = 0.5) +
+  geom_point(aes(x = par_ue, y = estimate, color = as.factor(well)), size = 1) +
+  # geom_ribbon(aes(x = E_days, ymin = (.fitted - .resid), ymax = (.fitted + .resid), alpha = 0.1),show.legend = FALSE) +
+  facet_grid(cols = vars(strain), rows = vars(par_ue)) +
+  ylim(0, 1) +
+  theme_bw() 
+
+test <- full_join(ChlLogSpecificCoeff %>% rename("Chl_estimate" = "estimate") %>% select(-c(std.error, statistic, p.value)), CellLogSpecificCoeff %>% rename("Cell_estimate" = "estimate") %>% filter(Viability %in% c("AliveCells")) %>%select(-c(std.error, statistic, p.value, Viability))) %>%
+  filter(term %in% c("Mu")) %>%
+  group_by(strain, par_ue) %>%
+  mutate(Cell_estimate_av = mean(Cell_estimate),
+         Chl_estimate_av = mean(Chl_estimate)) %>%
+  ggplot(aes(x = Cell_estimate_av, y = Chl_estimate_av, color = as.factor(par_ue))) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1) +
+  #coord_cartesian(ylim = c(0, 3), xlim = c(0, 3)) +
+  facet_grid(cols = vars(strain)) + 
+  theme(aspect.ratio = 1) +
+  theme_bw()
+test
+
+CellChl <- GrowthCellChl %>%
+  filter(Viability %in% "TotCy5Cells") %>%
+  mutate(Chl_Cell = Chl_ugL_mean/Cellcount_L*10^6) %>%
+  filter(strain %in% "CZS25K")
+  ggplot(aes(x = date_sink, y = log(Chl_Cell), color = as.factor(par_ue))) +
+  geom_point() +
+  #coord_cartesian(ylim = c(0, 3), xlim = c(0, 3)) +
+  facet_grid(
+            rows = vars(par_ue),
+             cols = vars(strain)) + 
+  theme(aspect.ratio = 1) +
+  theme_bw() 
 
 ```
 
@@ -341,6 +820,7 @@ BrkSink <- Brk_Compare %>%
 BrkSink
 
 ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, "BreakingPointAll_SinkAvPlot.png", sep = "_"), fsep = .Platform$file.sep), plot = BrkSink, height = 10, width = 12)
+
 Strain <- "PCC6803"
 test <- SinkAvShort %>%
   group_by(GroupID, ColonySink) %>%

@@ -1,0 +1,111 @@
+---
+title: "SinkCytometer_analyses"
+output: html_notebook
+
+Authors: Maximilian Berthold, Rahel Vortmeyer-Kley
+
+---
+
+#Below are the parameters for the data import of the Cytometer data.
+
+```{r}
+
+Project <- "PhytoSink"
+FP1 <- ".."
+PlotFolder <- "Plots"
+DataIn <- "TidyData"
+DataOut <- "ModelData"
+FileID <- "sink"
+
+```
+
+#Packages needed.
+
+```{r load libraries,  message = FALSE, warning = FALSE, echo=FALSE}
+
+library(tidyverse)
+library(lubridate)
+library(stringr)
+library(broom)
+library(knitr)
+library(OneR)
+library(zoo) #creation of time series objects
+library(timetk)
+library(xts) #creation of time series objects
+library(strucchange) #breakpoint analyses
+library(changepoint) #changepoint analyses
+library(chngpt) #changepoint analyses
+library(segmented) #breakpoint analyses
+library(googledrive)
+library(googlesheets4)
+library(rhdf5)
+library(minpack.lm)
+library(nlstools)
+library(nlsMicrobio)
+#library(signal) #package containing Savitzky-Golay smoothing filter
+  
+```
+
+
+``` {r plate design except 2022-10-14}
+TimeSec <- expand_grid(
+  TimeSec = seq(from = min(8),
+                to = max(576),
+                by = 8))
+
+WellPlate <- expand_grid(
+  RowLetter = LETTERS[1:8],
+  ColNumber = seq(from=min(1), 
+              to=max(12), 
+              length.out = 12)) %>%
+  filter(RowLetter != c("A"),
+         RowLetter != c("H"))  %>%
+  arrange(ColNumber) %>%
+  unite('well_target', RowLetter:ColNumber, remove = TRUE, sep = "") %>%
+  cbind(TimeSec) %>% 
+  expand_grid(date_sink = seq(from = as.Date('2022-10-15'), 
+                  to = as.Date('2022-10-21'),
+                  by = 'days',
+                  times = 7))
+  
+
+```
+
+
+``` {r plate design 2022-10-14}
+TimeSec <- expand_grid(
+  TimeSec = seq(from = min(8),
+                to = max(576),
+                by = 8))
+
+WellPlate_d0 <- expand_grid(
+  RowLetter = LETTERS[1:8],
+  ColNumber = seq(from=min(1), 
+              to=max(12), 
+              length.out = 12)) %>%
+  filter(ColNumber != c("6"),
+         ColNumber != c("12"))  %>%
+  arrange(ColNumber) %>%
+  unite('well_target', RowLetter:ColNumber, remove = TRUE, sep = "") %>%
+  filter(well_target != "E5",
+         well_target != "F5",
+         well_target != "G5",
+         well_target != "H5",
+         well_target != "E11",
+         well_target != "F11",
+         well_target != "G11",
+         well_target != "H11") %>%
+  cbind(TimeSec) %>%
+  mutate(date_sink = as.Date("2022-10-14"))
+
+```
+
+``` {r}
+WellPlate_TimeCorr <- rbind(WellPlate_d0, WellPlate)
+
+saveRDS(WellPlate_TimeCorr, file.path(paste(FP1, DataIn, sep = "/"),
+paste(Project, "WellPlate_TimeCorr.Rds", sep = "_"), fsep = .Platform$file.sep))
+
+
+```
+

@@ -57,6 +57,7 @@ gs4_deauth()
 MetaData <- read_sheet("https://docs.google.com/spreadsheets/d/1jBRuKWXGL9MDtD3e_NGhhrhWPrB0OdJ8XmJRKQrg0Oo/edit#gid=0")
 SinkProt <- read_sheet("https://docs.google.com/spreadsheets/d/1ya-DkakngUYXZce1Ty0l2oX5AvULkLLayoCAgkSexRs/edit?pli=1#gid=0") %>%
   mutate(date_sink = ymd(date_sink))
+WellPlate_TimeCorr <- readRDS(file = file.path(paste(FP1, DataOut, sep = "/"), paste(Project, "WellPlate_TimeCorr.Rds", sep  = "_"),fsep = .Platform$file.sep))
 
 ```
 
@@ -128,9 +129,11 @@ SinkTidy <- full_join(SinkTidyAlive, SinkTidyDead)%>%
 SinkMetaAll <- inner_join(SinkTidy, SinkProt, by = c("well_target", "date_sink", "strain")) %>% 
   rename("TimeID" = "T Id", "well" = "well_source",  "plate" = "plate_origin") %>%
   distinct() %>%
-  mutate(ElapMin = (TimeID * 10)-5, #TimeIDs are 10 min apart and ID 1 is the very first measurement (0 min), but it took ~2 - 4 minutes to load each plate prior analyses, though *10 - 5 corrects for loadings, but includes the 10 min interval
-         ElapSec = ElapMin * 60,
-         ElapHour = ElapMin / 60, 
+  full_join(WellPlate_TimeCorr) %>%
+  mutate(StartMin = (TimeID * 10) - 7, #TimeIDs are 10 min apart and ID 1 is the very first measurement (0 min), but it took ~2 - 4 minutes to load each plate prior analyses, though *10 - 5 corrects for loadings, but includes the 10 min interval
+         ElapSec = StartMin * 60 + TimeSec,
+         ElapMin = ElapSec / 60,
+         ElapHour = ElapSec / 3600, 
          Elapsed.Time.m = strftime(as.POSIXct(ElapHour * 60 * 60 , origin = date_sink), format = "%H:%M:%S"), #shows time format with 20 hour offset
          DiffCy5_DeadAlive = Cy5CellCount - TotCy5Cells) 
   

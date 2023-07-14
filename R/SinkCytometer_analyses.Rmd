@@ -55,6 +55,7 @@ MetaData <- read_sheet("https://docs.google.com/spreadsheets/d/1jBRuKWXGL9MDtD3e
 SinkProt <- read_sheet("https://docs.google.com/spreadsheets/d/1ya-DkakngUYXZce1Ty0l2oX5AvULkLLayoCAgkSexRs/edit?pli=1#gid=0") %>%
   mutate(date_sink = ymd(date_sink))
 
+
 ```
 
 
@@ -63,21 +64,22 @@ CapArea_mm2 <- 0.48 #captured area based on MD Pico software
 RelTotArea <- 0.0141 #relative area per well in percent based on MD Pico software
 TotArea_mm2 <- CapArea_mm2/RelTotArea
 
-
 SinkMeta <- MetaData %>%
   full_join(SinkProt, by = c("id" = "culture_ID", "strain" = "strain", "plate" = "plate_origin", "well" ="well_source")) %>%
-  select(-c(id, well, well_target, PropidiumIod_vol_uL)) %>% #unselect Propidium iodide here, as there was a pipetting error once! Calculate true cellcount before that step!!!
+  dplyr::select(-c(id, well, well_target, PropidiumIod_vol_uL)) %>% #unselect Propidium iodide here, as there was a pipetting error once! Calculate true cellcount before that step!!!
   mutate(exp_date = ymd(exp_date))
   
 SinkCC <- ImportSink %>%
-  select(strain, date_sink, datetime, par_ue, ElapMin, TimeID, well, well_target, CorrDeadCells, AliveCells, DeadAliveCells, TotCy5Cells, culture_vol_uL, PropidiumIod_vol_uL) %>%
+  dplyr::select(strain, date_sink, datetime, par_ue, StartMin, ElapSec, ElapMin, TimeID, well, well_target, CorrDeadCells, AliveCells, DeadAliveCells, TotCy5Cells, culture_vol_uL, PropidiumIod_vol_uL) %>%
   full_join(SinkMeta) %>%
   distinct() %>%
   group_by(strain, date_sink, par_ue, well) %>%
   dplyr::filter(date_sink != "2022-10-20") %>% #data for 20th October currently lost, filter for empty entry
   drop_na(project_id) %>%
   mutate(
-         sink_hour = datetime + minutes(ElapMin),
+         ShareAliveTotCy = max(AliveCells)/max(TotCy5Cells)*100,
+         ShareDeadAliveTotCy = max(DeadAliveCells)/max(TotCy5Cells)*100,
+         sink_hour = datetime + seconds(ElapSec),
          sink_hour = replace(sink_hour, is.na(sink_hour), datetime)
          ) %>%
   pivot_longer(cols = c(CorrDeadCells, AliveCells, DeadAliveCells, TotCy5Cells), names_to = "Viability", values_to = "Cellcount") %>%
@@ -103,7 +105,7 @@ opt_bpts <- function(x) { #function to determine optimal amount of breaking poin
 SinkBreak <- SinkCC %>%
   ungroup() %>%
   mutate(Cellcount_L = replace(Cellcount_L, is.na(Cellcount_L), 0)) %>%# replace NAs in Cellcount_L with 0 just for breakpoint analyses
-  select(GroupID, Cellcount_L, sink_hour) %>%
+  dplyr::select(GroupID, Cellcount_L, sink_hour) %>%
   group_by(GroupID) %>%
   nest() %>%
   mutate(ts = map(.x = data, 
@@ -111,10 +113,14 @@ SinkBreak <- SinkCC %>%
                   select = -sink_hour),
          bp_ts = map(ts, ~breakpoints(formula = Cellcount_L ~ 1, data = .)),
          bpts_sum = map(bp_ts, ~summary(.x)),
-         opt_brks = map(bpts_sum, ~opt_bpts(.x$RSS["BIC",]))) %>%
-  unnest_wider(opt_brks) %>%
-  rename("opt_brks" = "...1") %>%
+         opt_brks = map(bpts_sum, ~opt_bpts(.x$RSS["BIC",])),
+         opt_brks = purrr::modify(opt_brks, ~ if(length(.) == 0){  #https://stackoverflow.com/questions/67073645/replace-numeric0-with-0-in-r-list
+                                   0 
+                                   } else { . })) %>%
+  unnest_wider(opt_brks, names_sep = "_", names_repair = "unique") %>%
+  rename("opt_brks" = "opt_brks_1") %>%
   mutate(opt_brks = replace(opt_brks, is.na(opt_brks), 0))
+
 
   
 Mbrk = matrix(data = NA, nrow = nrow(SinkBreak), ncol = 6)
@@ -138,7 +144,7 @@ df_brkpt <- as.data.frame(Mbrk) %>%
 
 df_strain <- SinkCC %>%
   ungroup() %>%
-  select(Viability, GroupID, strain, date_sink, par_ue) %>%
+  dplyr::select(Viability, GroupID, strain, date_sink, par_ue) %>%
   distinct()
 
 impute_brkpt1 <- full_join(df_brkpt, df_strain) %>%
@@ -150,7 +156,7 @@ impute_brkpt1 <- full_join(df_brkpt, df_strain) %>%
          TimeID = if_else(TimeID >= 1.5*Brkpt1Av, Brkpt1Av, TimeID),
          TimeID = round(TimeID)
          ) %>%
-  select(-Brkpt1Av)
+  dplyr::select(-Brkpt1Av)
 
 impute_brkpt <- full_join(df_brkpt, df_strain) %>%
   group_by(Viability, par_ue, strain) %>%
@@ -163,60 +169,65 @@ Brk_Compare <- full_join(SinkCC, impute_brkpt) %>%
   arrange(GroupID) %>%
   separate(BrkptNo, into = c("Brkpt", "BrkptNo"), sep = "_") %>%
   mutate(BrkTime = case_when(BrkptNo != "NA" ~ ElapMin*1),
-         BrkTime = replace(BrkTime, is.na(BrkTime), 0),
+         BrkTime = replace(BrkTime, is.na(BrkTime), NA),
          BrkptNo = as.numeric(BrkptNo)) %>%
   fill(BrkptNo, .direction = "up") %>%
+  fill(BrkTime, .direction = "up") %>%
   mutate(Cellcount = replace(Cellcount, is.na(Cellcount), 0), # replace NA with 0, as nothing was detected
          CellcountStep = cummax(Cellcount), #https://stackoverflow.com/questions/64029692/ifelse-replace-value-if-it-is-lower-than-previous
          CellcountDiff = CellcountStep - lag(CellcountStep),
+         CellcountDiff = coalesce(CellcountDiff, Cellcount), #replaces NAs in CellcountDiff for TimeID1 with the cellcount at this time point, TimeID0 would be 0 cells, but is not present so causes NA instead
          BrkptNo = if_else(BrkptNo > 1, 2, 1)) %>% #sort breaking points into pre-colony sinking breakpoint-period 1, and post-colony as breakpoint-period 2 
   group_by(strain, GroupID, Viability, BrkptNo) %>% #explicitly group to calculate peak-filter based on peak height twice standard deviation
-  mutate(CellcountDiffSD = sd(CellcountDiff, na.rm = TRUE),
+  mutate(CellcountDiffSD = sd(CellcountDiff, na.rm = TRUE),  
          CellcountDiffSDFlag = if_else(CellcountDiff >= 2*CellcountDiffSD, 1, 0),
          CellcountMax = if_else(CellcountDiff >= 2*CellcountDiffSD, as.numeric(CellcountDiff), 0),
-         BrkTime_test = if_else(CellcountMax > 0, ElapMin, BrkTime),
+         PeakTime = if_else(CellcountMax > 0, ElapMin, 0), #peak time calculated for all cellcount, also calculated for CellCountMax > 0 ? 
          tot_vol_uL = added_culture_uL + media_vol_uL,
          well_radius_mm = case_when(plate_type == "Greiner655090" ~ 3.29),
          sink_height_mm = tot_vol_uL/(pi*well_radius_mm^2),
-         sink_vel_mm_min = sink_height_mm/BrkTime_test
-         )
-         
+         sink_vel_mm_min = sink_height_mm/PeakTime,
+         relPeakOcc = PeakTime/BrkTime
+         ) 
+
 BrkSink <- Brk_Compare %>%
   filter(
+         #TimeID == 1,
          #strain == "CCMP1335",
          sink_vel_mm_min != Inf,
          CellcountDiffSDFlag != 0,
+         CellcountMax > 1, 
          BrkptNo == 1,
-         Viability == "AliveCells",
-         sink_vel_mm_min < 0.4
+         #Viability == "CorrDeadCells",
+         #sink_vel_mm_min < 0.4
          ) %>%
   drop_na(BrkptNo) %>%
   #        #BrkptNo == "Brkpt_1") %>%
-  ggplot(aes(y = sink_vel_mm_min, x = sink_hour, color = as.factor(well))) +
+  ggplot(aes(y = log(CellcountMax), x = ElapMin, color = as.factor(par_ue))) +
   geom_point() +
   #geom_line(aes(y = sink_vel_mm_min, x = sink_hour, color = as.factor(well))) +
   #geom_point(aes(y = (CCDiffNoNoise), x = ElapMinAv, color = "red")) +
   #geom_smooth(method = "loess", se=FALSE, color="black", formula = y ~ x) +
   #geom_vline(aes(xintercept = CCDiffNoNoise)) +
-  #geom_vline(aes(xintercept = BrkTime_test, color = as.factor(date_sink))) +
+  #geom_vline(aes(xintercept = PeakTime, color = as.factor(BrkptNo))) +
   facet_grid(
-     rows = vars(strain),
-    cols = vars(par_ue)
+     rows = vars(Viability),
+    cols = vars(date_sink)
     ) +
-  coord_cartesian(
-    #xlim = c(0, 0.4)
-                   ylim = c(0, 0.5)
-                   ) +
+  # coord_cartesian(
+  #   #xlim = c(0, 0.4)
+  #                  ylim = c(0, 0.5)
+  #                  ) +
   theme_bw()
 BrkSink
 
 SinkSizeTotArea <- ImportSink %>%
-  select(date_sink, TimeID, well_target, well, strain, par_ue, Cy5TotArea, DeadTotArea, DeadAliveCTotArea) %>%
+  dplyr::select(date_sink, TimeID, well_target, well, strain, par_ue, Cy5TotArea, DeadTotArea, DeadAliveCTotArea) %>%
   rename("AliveCells" = 'Cy5TotArea', 'CorrDeadCells' = 'DeadTotArea', 'DeadAliveCells' = 'DeadAliveCTotArea') %>%
   pivot_longer(cols = c(AliveCells, CorrDeadCells, DeadAliveCells), names_to = "Viability", values_to = "TotCellArea")
 
 SinkSize <- ImportSink %>%
-  select(date_sink, TimeID, well_target, well, strain, par_ue, Cy5AvArea, DeadAvArea, DeadAliveCAvArea) %>%
+  dplyr::select(date_sink, TimeID, well_target, well, strain, par_ue, Cy5AvArea, DeadAvArea, DeadAliveCAvArea) %>%
   rename("AliveCells" = 'Cy5AvArea', 'CorrDeadCells' = 'DeadAvArea', 'DeadAliveCells' = 'DeadAliveCAvArea') %>%
   pivot_longer(cols = c(AliveCells, CorrDeadCells, DeadAliveCells), names_to = "Viability", values_to = "AvCellArea") %>%
   full_join(SinkSizeTotArea) %>%
@@ -227,49 +238,100 @@ SinkSize <- ImportSink %>%
   mutate(CellcountDiff = replace(CellcountDiff, is.na(CellcountDiff), 0),
          CellcountDiff = if_else(CellcountDiff > lag(CellcountDiff), as.numeric(CellcountDiff), 0),
          TotCellArea = if_else(TotCellArea > lag(TotCellArea), as.numeric(TotCellArea), 0),
-         AvCellSurfDiff = (TotCellArea - lag(TotCellArea))/(CellcountDiff - lag(CellcountDiff)),  #create change in cell surface area between time points
+         AvCellSurfDiff = (TotCellArea - lag(TotCellArea))/(CellcountDiff),  #create change in cell surface area between time points
          AvCellSurfDiff = replace(AvCellSurfDiff, is.na(AvCellSurfDiff), 0),
          AvCellSurfDiff = replace(AvCellSurfDiff, is.infinite(AvCellSurfDiff), 0),
          AvCellSurfDiff = replace(AvCellSurfDiff, is.nan(AvCellSurfDiff), 0),
-         CellRadius = (2*(sqrt(AvCellSurfDiff/pi)))
+         CellDiameter = (2*(sqrt(AvCellSurfDiff/pi)))
          ) %>%
   filter(AvCellSurfDiff > 0)
 
-
-SinkSizePlot <- SinkSize %>% 
+SinkCC %>% 
   filter(
-         #strain == "CCMP836",
-         CellRadius < 100,
-         sink_vel_mm_min != Inf,
-         CellcountDiffSDFlag != 0,
+         strain == "CCMP1335",
+         #CellDiameter < 40,
+         #sink_vel_mm_min != Inf,
+         #CellcountDiffSDFlag != 0,
          #par_ue == 30,
-         #date_sink == "2022-10-17",
+         date_sink != "2022-10-14",
          #well == 'A2'
          #CellAreaScale >= 0,
          #CellAreaScale <= 1,
-         BrkptNo == 1,
-         #Viability == "CorrDeadCells",
+         #BrkptNo == 1,
+         Viability == "CorrDeadCells",
          #sink_vel_mm_min < 0.4
          ) %>%
   #drop_na(BrkptNo) #%>%
   #        #BrkptNo == "Brkpt_1") %>%
-  ggplot(aes(y = (sink_vel_mm_min), x = (CellRadius), color = as.factor(strain))) +
+  ggplot(aes(y = (Cellcount), x = (ElapMin), color = as.factor(par_ue))) +
   geom_point() +
  #  geom_point(aes(y = sink_vel_mm_min/100, color = "SinkVeloc"), data = SinkSize) +
  #  scale_y_continuous(
  # # labels = number_format(scale = 1e-3),
  #  sec.axis = sec_axis(trans = ~ .x / 100
  #                      )) +
-  geom_smooth(method = "lm",  formula = y ~ 0 + x, se=TRUE, color = "black") +
+  #geom_smooth(method = "lm",  formula = y ~ 0 + x, se=TRUE, color = "black") +
+  facet_grid(
+     rows = vars(par_ue),
+    cols = vars(date_sink)
+    ) + 
+  ylim(0, 100) +
+  theme_bw()
+
+
+
+SinkSizePlot <- Brk_Compare %>% 
+  group_by(par_ue, strain, date_sink, Viability) %>%
+  filter(
+         #strain %in%c("CCMP836", "CZS25K", "PCC6803"),
+         strain %in%c(#"CCMP495",
+                      "CCMP1335"
+                      #"CCMP1336"
+                      ),
+         #CellDiameter < 5,
+         sink_vel_mm_min != Inf,
+         CellcountDiffSDFlag != 0,
+         CellcountMax > 1, 
+         BrkptNo == 1,
+         #par_ue == 30,
+         #date_sink == "2022-10-21",
+         #date_sink == c("2022-10-15", "2022-10-17", "2022-10-19", "2022-10-21"),
+         #well == 'A2'
+         #CellAreaScale >= 0,
+         #CellAreaScale <= 1,
+         #Viability == "AliveCells",
+         #sink_vel_mm_min < 0.2
+         ) %>%
+  #mutate(sink_vel_mm_min = sink_vel_mm_min[which.max(CellcountStep)]) %>% #selects only sinking rates per well that coincide with cell count maximum
+  #drop_na(BrkptNo) #%>%
+  #        #BrkptNo == "Brkpt_1") %>%
+  ggplot(aes(y = (sink_vel_mm_min), x = as.factor(date_sink), color = as.factor(par_ue))) +
+  #geom_point() +
+  geom_violin(#trim = FALSE
+              ) +
+  #geom_boxplot(width = .2) +
+ #  geom_point(aes(y = sink_vel_mm_min/100, color = "SinkVeloc"), data = SinkSize) +
+ #  scale_y_continuous(
+ # # labels = number_format(scale = 1e-3),
+ #  sec.axis = sec_axis(trans = ~ .x / 100
+ #                      )) +
+  # geom_smooth(method = "loess"
+  #             #,  formula = y ~ 0 + x, se=TRUE, color = "black"
+  #             ) +
   facet_grid(
      rows = vars(Viability),
     cols = vars(par_ue)
-    ) + 
-  #ylim(0, 1000) +
-  theme_bw()
+    )  +
+  ylim(0, 0.5) +
+  theme_bw() +
+  theme(axis.text.x = element_text(
+      angle = 25, hjust = 1))
 SinkSizePlot
 
-ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, "CellRadius", "SinkVeloPlot.png", sep = "_"), fsep = .Platform$file.sep), plot = SinkSizePlot, height = 10, width = 12)
+ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, "Diatom", "SinkVeloPlot.png", sep = "_"), fsep = .Platform$file.sep), plot = SinkSizePlot, height = 10, width = 12)
+
+
+
 # ExportSize <- SinkSize %>%
 #   dplyr::filter(
 #          strain %in% c("CCMP1335")
@@ -277,6 +339,49 @@ ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Projec
 #   select(ElapMin, Viability, par_ue, strain, sink_hour, date_sink, AvCellArea, TotCellArea, Cellcount, well, sink_vel_mm_min)
 # 
 # h5write(ExportSize, "ExportSize_sink.h5", name = "CCMP1335")
+
+ImportSink %>%
+  filter(  
+         strain == "PCC6803", #PCC6803 CZS25K CCMP836 CCMP1336 CCMP1335 CCMP495
+         #date_sink != "2022-10-14"
+         #Cy5AvArea < 7,
+         ElapMin < 200
+  ) %>%
+  ggplot(aes(y = (Cy5AvArea), x = (ElapMin), color = as.factor(par_ue))) + #https://support.moleculardevices.com/s/article/MetaXpress-and-MetaMorph-Relationship-between-Average-Intensity-and-Integrated-Intensity
+  geom_point() +
+  geom_smooth(method = "loess"
+               #,  formula = y ~ 0 + x, se=TRUE, color = "black"
+                ) +
+  facet_grid(
+     rows = vars(par_ue),
+    cols = vars(date_sink)
+    ) + 
+  #ylim(0, 100) +
+  theme_bw()
+
+#calculate a GAM model based on Cy5AvArea ~ ElapMin with log-scaled normalized data points and sample_date as random factor. See if signal of smaller cells in colonies, larger single cells and smaller single cells persists. 
+
+SinkSize %>%
+  filter(  
+         strain == "CCMP1336", #PCC6803 CZS25K CCMP836 CCMP1336 CCMP1335 CCMP495
+         #date_sink != "2022-10-14"
+         #Cy5AvArea < 7,
+         ElapMin < 300,
+         AvCellArea < 1000
+  ) %>%
+  ggplot(aes(y = (AvCellArea), x = (ElapMin)
+             , color = as.factor(Viability)
+             )) + #https://support.moleculardevices.com/s/article/MetaXpress-and-MetaMorph-Relationship-between-Average-Intensity-and-Integrated-Intensity
+  geom_point() +
+  geom_smooth(method = "loess"
+               #,  formula = y ~ 0 + x, se=TRUE, color = "black"
+                ) +
+  facet_grid(
+     rows = vars(par_ue),
+    cols = vars(strain)
+    ) + 
+  ylim(0, 1000) +
+  theme_bw()
 
 ```
 
@@ -307,15 +412,19 @@ GrowthCC <- SinkCC %>%
   mutate(LagSeed = E_days[which.min(!!sym(FitVar))])
 
 GrowthCC %>%
-  #filter(strain %in% "CZS25K") %>%
-  filter(Viability %in% "CorrDeadCells") %>%
+  filter(strain %in%c("CCMP836", "CZS25K", "PCC6803"),
+         #strain %in%c("CCMP495", "CCMP1335", "CCMP1336")
+         ) %>%
+  filter(Viability %in% c("TotCy5Cells", "CorrDeadCells"),
+         Cellcount_L < 200000000000) %>%
   #filter(exp_date == "20200902") %>%
   #filter(tissue_treated_plate == TissueTreated) %>%
   #filter(media == Media) %>%
   #filter(SourceSal == source_salinity) %>%
-  ggplot()+
-  geom_point(aes(x = E_days, y = log(!!sym(FitVar)), colour = as.factor(well), shape = as.factor(!!sym(ColVar2)))) +
-  geom_line(aes(x = E_days, y = log(!!sym(FitVar)), colour = as.factor(well), shape = as.factor(!!sym(ColVar2)))) +
+  ggplot(aes(x = E_days, y = (!!sym(FitVar)),  color = as.factor(!!sym(ColVar2))))+
+  geom_point() +
+  #geom_line(aes(x = E_days, y = log(!!sym(FitVar)), color = as.factor(!!sym(ColVar2)))) +
+  geom_smooth(method = "loess") +
   #coord_cartesian(ylim = c(0, 2)) +
   facet_grid(cols = vars(!!sym(ColVar)), rows = vars(!!sym(RowVar))) +
   theme_bw() 
@@ -363,8 +472,7 @@ CellMuSpecific <- GrowthNestSpecific %>%
     FitGompertz = (map(data, ~possibnlSLM(logFitVarminFitVar ~ ModGompertzEqn(x = E_days, Lag, Gmu, Gmax),
                                     data = .x,
                                     start = list(Lag = LagSeed, Gmu = (log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days), Gmax = max(.[, "logFitVarminFitVar"], na.rm = TRUE)),
-                                    control = list(maxiter = 1000)
-                            ,
+                                    control = list(maxiter = 1000),
                                     lower = c(0, ((log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days)) * 0.05, max(.[, "logFitVarminFitVar"], na.rm = TRUE) * 0.05),
                                     upper = c(1000, ((log(max(.[, FitVar], na.rm = TRUE)) - log(min(.[ FitVar], na.rm = TRUE)))/max(.$E_days)) * 10000, max(.[, "logFitVarminFitVar"], na.rm = TRUE) * 10000)))),
     PredictGompertz = map(FitGompertz, augment),
@@ -386,9 +494,11 @@ CellGompertzSpecificCoeff <- CellMuSpecific %>%
   dplyr::select(c(!!sym(RowVar), !!sym(ColVar), !!sym(ColVar2), well, term:p.value)) 
 
 CellLogSpecificPlot <- CellLogSpecificPredict %>% 
+  dplyr::filter(Viability == "TotCy5Cells",
+                strain %in% c("CCMP495", "CCMP1335", "CCMP1336")) %>%
   ggplot() +  
-  geom_line(aes(x = E_days, y = log(.fitted), color = as.factor(Viability)), size = 0.5) +
-  geom_point(aes(x = E_days, y = log(!!sym(FitVar)), color = as.factor(Viability)), size = 0.6) +
+  geom_line(aes(x = E_days, y = log10(.fitted), color = as.factor(well)), size = 0.5) +
+  geom_point(aes(x = E_days, y = log10(!!sym(FitVar)), color = as.factor(well)), size = 0.6) +
   # geom_ribbon(aes(x = E_days, ymin = (.fitted - .resid), ymax = (.fitted + .resid), alpha = 0.1),show.legend = FALSE) +
   facet_grid(cols = vars(strain), rows = vars(par_ue)) +
   theme_bw() #+
@@ -430,17 +540,32 @@ CellLogSpecificCoeff %>%
   filter(term == "Mu") %>%
   ggplot() +  
   #geom_line(aes(x = par_ue, y = estimate, color = as.factor(well)), size = 0.5) +
-  geom_point(aes(x = par_ue, y = estimate, color = as.factor(well)), size = 1) +
+  geom_point(aes(x = par_ue, y = estimate, color = as.factor(par_ue)), size = 1) +
   # geom_ribbon(aes(x = E_days, ymin = (.fitted - .resid), ymax = (.fitted + .resid), alpha = 0.1),show.legend = FALSE) +
   facet_grid(cols = vars(strain), rows = vars(Viability)) +
   ylim(0, 3) +
   theme_bw() 
 
+
+SelectStrain <- 'CCMP495' #"CCMP495", "CCMP1335", "CCMP1336" "CCMP836", "CZS25K", "PCC6803"
+SelectViability <- "DeadAliveCells" #CorrDeadCells AliveCells DeadAliveCells TotCy5Cells
+
+# ExportCellCount <- GrowthCC %>%
+#   select(date_sink, well, Viability, par_ue, strain, Cellcount_L) %>%
+#   dplyr::filter(
+#          strain %in% SelectStrain,
+#          Viability %in%  SelectViability #CorrDeadCells AliveCells DeadAliveCells TotCy5Cells
+#          ) %>%
+#   pivot_wider(names_from = par_ue, names_prefix = "Cell_L_par", names_sep = "_", values_from = c(Cellcount_L))
+# 
+# 
+# h5write(ExportCellCount, "ExportCellCount.h5", name = paste(SelectViability, SelectStrain))
+
 ```
 
 
 
-``` {r growth rate based on Chlorophyll extraction} 
+``` {r growth rate based on Chlorophyll extraction, warning = FALSE} 
 #grouping variables for rows & columns, and for nesting for fitting
 RowVar <- "par_ue" 
 RowVar2 <- "date_sink"
@@ -481,7 +606,8 @@ ChlFluor %>%
 
 GrowthCellChl <- full_join(ChlFluor, GrowthCC) %>%
   group_by(!!sym(RowVar), !!sym(ColVar),  well) %>%
-  mutate(LagSeed = E_days[which.min(!!sym(FitVar))]) %>%
+  mutate(LagSeed = E_days[which.min(!!sym(FitVar))], 
+         exp_date = ymd(exp_date)) %>%
   filter(Viability == "TotCy5Cells") #track growth based on all Chl-fluorescing cells, dead or DeadAlive
  
 #Define equations as functions.
@@ -551,8 +677,8 @@ ChlGompertzSpecificCoeff <- ChlMuSpecific %>%
 
 ChlLogSpecificPlot <- ChlLogSpecificPredict %>% 
   ggplot() +  
-  geom_line(aes(x = E_days, y = log(.fitted), color = as.factor(well)), size = 0.5) +
-  geom_point(aes(x = E_days, y = log(!!sym(FitVar)), color = as.factor(well)), size = 0.6) +
+  geom_line(aes(x = E_days, y = log10(.fitted), color = as.factor(well)), size = 0.5) +
+  geom_point(aes(x = E_days, y = log10(!!sym(FitVar)), color = as.factor(well)), size = 0.6) +
   # geom_ribbon(aes(x = E_days, ymin = (.fitted - .resid), ymax = (.fitted + .resid), alpha = 0.1),show.legend = FALSE) +
   facet_grid(cols = vars(strain), rows = vars(par_ue)) +
   theme_bw() #+
@@ -594,14 +720,28 @@ ChlLogSpecificCoeff %>%
   filter(term == "Mu") %>%
   ggplot() +  
   #geom_line(aes(x = par_ue, y = estimate, color = as.factor(well)), size = 0.5) +
-  geom_point(aes(x = par_ue, y = estimate, color = as.factor(well)), size = 1) +
+  geom_point(aes(x = par_ue, y = estimate, color = as.factor(par_ue)), size = 1) +
   # geom_ribbon(aes(x = E_days, ymin = (.fitted - .resid), ymax = (.fitted + .resid), alpha = 0.1),show.legend = FALSE) +
-  facet_grid(cols = vars(strain), rows = vars(par_ue)) +
-  ylim(0, 1) +
+  facet_grid(cols = vars(strain)
+             #, rows = vars(par_ue)
+             ) +
+  #ylim(0, 1) +
   theme_bw() 
 
-test <- full_join(ChlLogSpecificCoeff %>% rename("Chl_estimate" = "estimate") %>% select(-c(std.error, statistic, p.value)), CellLogSpecificCoeff %>% rename("Cell_estimate" = "estimate") %>% filter(Viability %in% c("AliveCells")) %>%select(-c(std.error, statistic, p.value, Viability))) %>%
-  filter(term %in% c("Mu")) %>%
+ChlGompertzSpecificCoeff %>% 
+  filter(term == "Gmu") %>%
+  ggplot() +  
+  #geom_line(aes(x = par_ue, y = estimate, color = as.factor(well)), size = 0.5) +
+  geom_point(aes(x = par_ue, y = estimate, color = as.factor(par_ue)), size = 1) +
+  # geom_ribbon(aes(x = E_days, ymin = (.fitted - .resid), ymax = (.fitted + .resid), alpha = 0.1),show.legend = FALSE) +
+  facet_grid(cols = vars(strain)
+             #, rows = vars(par_ue)
+             ) +
+  #ylim(0, 1) +
+  theme_bw() 
+
+test <- full_join(ChlLogSpecificCoeff %>% rename("Chl_estimate" = "estimate") %>% dplyr::select(-c(std.error, statistic, p.value)), CellLogSpecificCoeff %>% rename("Cell_estimate" = "estimate") %>% filter(Viability %in% c("AliveCells")) %>% dplyr::select(-c(std.error, statistic, p.value, Viability))) %>%
+  dplyr::filter(term %in% c("Mu")) %>%
   group_by(strain, par_ue) %>%
   mutate(Cell_estimate_av = mean(Cell_estimate),
          Chl_estimate_av = mean(Chl_estimate)) %>%
@@ -616,19 +756,808 @@ test
 
 CellChl <- GrowthCellChl %>%
   filter(Viability %in% "TotCy5Cells") %>%
-  mutate(Chl_Cell = Chl_ugL_mean/Cellcount_L*10^6) %>%
-  filter(strain %in% "CZS25K")
+  mutate(Chl_Cell = Chl_ugL_mean/Cellcount_L*10^6,
+         exp_date = ymd(exp_date)) %>%
+  #left_join(SinkSize) #%>%
+  #filter(strain %in% "CZS25K") %>%
   ggplot(aes(x = date_sink, y = log(Chl_Cell), color = as.factor(par_ue))) +
   geom_point() +
+  #geom_smooth(method = "loess") +
   #coord_cartesian(ylim = c(0, 3), xlim = c(0, 3)) +
   facet_grid(
             rows = vars(par_ue),
              cols = vars(strain)) + 
-  theme(aspect.ratio = 1) +
+  #theme(aspect.ratio = 1) +
   theme_bw() 
+CellChl
+
+# MaxSinkCC <- SinkCC %>% 
+#   mutate(MaxCellcount_L == max(Cellcount_L, na.rm = TRUE)) 
+
+Sink_Chl_Cell <- ChlFluor %>%
+  mutate(exp_date = ymd(exp_date))%>%
+  full_join(SinkCC %>% mutate(MaxCellcount_L = max(Cellcount_L, na.rm = TRUE))) %>%
+  mutate(
+         Chl_ugL_corr = case_when(Viability == "AliveCells" ~ Chl_ugL_mean*(ShareAliveTotCy/100),
+                                  Viability == "DeadAliveCells" ~ Chl_ugL_mean*(ShareDeadAliveTotCy/100),
+                                  #Viability == "TotCy5Cells" ~ Chl_ugL_mean, #sum of alive + DeadAlive, normal Chl-signal sufficient
+                                  #Viability == "CorrDeadCells" ~ Chl_ugL_mean*0 #don't possess Chlorophyll signal
+                                  ),
+         pg_Chl_Cell = case_when(Viability == "TotCy5Cells" ~ Chl_ugL_mean/MaxCellcount_L*10^6,
+                                 Viability == "CorrDeadCells" ~ Chl_ugL_mean*0,
+                                 Viability == "AliveCells" ~ Chl_ugL_corr/MaxCellcount_L*10^6, #use corrected Chl-amount on respective maximum cell count found that day in living cells based on living:DeadAlive
+                                 Viability == "DeadAliveCells" ~ Chl_ugL_corr/MaxCellcount_L*10^6) #use corrected Chl-amount on respective maximum cell count found that day in living cells based on living:DeadAlive
+         ) %>%
+  drop_na(pg_Chl_Cell) %>%
+  dplyr::select(date_sink, ElapMin, well, Viability, par_ue, strain, sink_hour, pg_Chl_Cell) %>%
+  full_join(Brk_Compare) %>%
+  mutate(
+         #pg_Chl_Cell = Chl_ugL_mean/Cellcount_L*10^6,
+         #pg_Chl_Cell = case_when(Viability == "TotCy5Cells" ~ Chl_ugL_mean/Cellcount_L*10^6),
+         date_sink = (as.character(date_sink)),
+         sink_hour = as.character(sink_hour)
+         ) %>%
+  dplyr::filter(BrkptNo == 1,
+         sink_vel_mm_min != Inf,
+         CellcountMax > 1,
+         CellcountDiffSDFlag == 1
+         ) %>% #filter only for significant peaks and maximum cells > 1
+  dplyr::select(date_sink, ElapMin, sink_vel_mm_min, well, Viability, par_ue, strain, sink_hour, pg_Chl_Cell, BrkTime, PeakTime, relPeakOcc) 
+
+
+SelectStrain <- 'PCC6803' #"CCMP495", "CCMP1335", "CCMP1336" "CCMP836", "CZS25K", "PCC6803"
+SelectViability <- "TotCy5Cells" #CorrDeadCells AliveCells DeadAliveCells TotCy5Cells
+
+# ExportSink <- Sink_Chl_Cell %>%
+#   dplyr::filter(
+#          strain %in% SelectStrain,
+#          Viability %in%  SelectViability #CorrDeadCells AliveCells DeadAliveCells TotCy5Cells
+#          ) %>%
+#   pivot_wider(names_from = par_ue, names_prefix = "par", names_sep = "_", values_from = c(sink_vel_mm_min, pg_Chl_Cell))
+# 
+# 
+# h5write(ExportSink, "ExportSinkVelo.h5", name = paste(SelectViability, SelectStrain))
 
 ```
 
+
+
+``` {r cluster analysis}
+
+# rng(1); % For reproducibility
+# [idx,C] = kmeans(X,3);
+
+possibKMEAN = possibly(.f = kmeans, otherwise = NULL)
+
+ClusterTime <- Brk_Compare %>%
+  mutate(PhytoGroup = case_when(strain %in% c("CZS25K","PCC6803","CCMP836") ~ "Cyanobacteria",
+                                strain %in% c("CCMP495","CCMP1335","CCMP1336") ~ "Diatoms")) %>%
+  dplyr::filter(BrkptNo == 1,
+         sink_vel_mm_min != Inf,
+         CellcountMax > 1,
+         CellcountDiffSDFlag == 1
+         ) %>%
+  ungroup() %>%
+  #group_by(PhytoGroup, par_ue, Viability) %>%
+  dplyr::select(date_sink)
+
+############### determination optimum k 
+kOpt <- Brk_Compare %>%
+  mutate(PhytoGroup = case_when(strain %in% c("CZS25K","PCC6803","CCMP836") ~ "Cyanobacteria",
+                                strain %in% c("CCMP495","CCMP1335","CCMP1336") ~ "Diatoms")) %>%
+  dplyr::filter(BrkptNo == 1,
+         sink_vel_mm_min != Inf,
+         CellcountMax > 1,
+         CellcountDiffSDFlag == 1
+         ) %>%
+  ungroup() %>%
+  group_by(PhytoGroup, par_ue, Viability) %>%
+  #mutate_at(c("sink_vel_mm_min"), ~(scale(.) %>% as.vector(.))) %>%
+  arrange(sink_vel_mm_min) %>%
+  dplyr::select(sink_vel_mm_min, Viability, par_ue, PhytoGroup) 
+
+point <- kOpt %>% 
+   ungroup() %>%
+   dplyr::select(sink_vel_mm_min)
+
+kclusts <- 
+  tibble(k = 1:9) %>%
+  mutate(
+    kclust = map(k, ~kmeans(point, .x)),
+    tidied = map(kclust, tidy),
+    glanced = map(kclust, glance),
+    augmented = map(kclust, augment, point)
+  )
+clusterings <- 
+  kclusts %>%
+  unnest(cols = c(glanced))
+
+ggplot(clusterings, aes(k, tot.withinss)) +
+  geom_line() +
+  geom_point()
+# "knee" of the optimum amount of k is ~2.5 so more than 3 centers have little value based on total within sum of squares
+################
+
+SinkCluster <- Brk_Compare %>%
+  mutate(PhytoGroup = case_when(strain %in% c("CZS25K", "CCMP836", "PCC6803") ~ "cyanobacteria",
+                                             strain %in% c("CCMP495", "CCMP1335") ~ "diatoms (<10 µm)",
+                                             strain %in% c("CCMP1336") ~ "diatom (> 10 µm)")
+           # case_when(strain %in% c("CZS25K","PCC6803","CCMP836") ~ "Cyanobacteria",
+           #                      strain %in% c("CCMP495","CCMP1335","CCMP1336") ~ "Diatoms")
+         ) %>%
+  dplyr::filter(BrkptNo == 1,
+         sink_vel_mm_min != Inf,
+         CellcountMax > 1,
+         CellcountDiffSDFlag == 1
+         ) %>%
+  ungroup() %>%
+  group_by(date_sink, PhytoGroup, par_ue, Viability) %>%
+  #mutate_at(c("sink_vel_mm_min"), ~(scale(.) %>% as.vector(.))) %>%
+  arrange(sink_vel_mm_min) %>%
+  dplyr::select(sink_vel_mm_min, Viability, par_ue, PhytoGroup) %>%
+  nest(sink_vel_mm_min) %>%
+  mutate(
+    kclust = map(data, ~possibKMEAN(.x[[1]], centers = 2, iter.max = 100, nstart = 100)),
+    tidied = map(kclust, tidy),
+    glanced = map(kclust, glance),
+    ClusterGroup = map(kclust, ~pluck(.x$cluster))
+  ) %>%
+  #unnest(tidied) %>%
+  unnest(ClusterGroup, data) 
+
+ClusterNames <- SinkCluster %>%
+  unnest(tidied) %>%
+  filter(cluster == ClusterGroup) %>%
+  rename("kMean" = "x1") %>%
+  dplyr::select(-c(size, withinss, kclust, glanced, sink_vel_mm_min)) %>%
+  distinct() %>%
+  pivot_wider(id_cols = c(date_sink:PhytoGroup), values_from = "kMean", names_from = cluster, names_prefix =  "Cluster_") %>%
+  mutate(Sub_Pop = case_when(Cluster_1 < Cluster_2 ~ "1_slow",
+                              Cluster_1 > Cluster_2 ~ "1_fast")) %>%
+  dplyr::select(-c(Cluster_2, Cluster_1))
+
+SinkPopulation <- full_join(SinkCluster, ClusterNames) %>%
+  mutate(Sub_Pop2 = case_when(Sub_Pop == "1_fast" ~ "2_slow",
+                              Sub_Pop == "1_slow" ~ "2_fast")) %>%
+  pivot_longer(cols = c(Sub_Pop, Sub_Pop2), names_to = "Population", values_to = "SinkVelo") %>%
+  separate(SinkVelo, into = c("Cluster", "SinkVelo"), sep = "_", remove = TRUE) %>%
+  dplyr::filter(Cluster == ClusterGroup) %>%
+  dplyr::select(c(date_sink:sink_vel_mm_min, SinkVelo))
+ 
+PhytoGroupPlot <- "diatoms (<10 µm)" #cyanobacteria 'diatoms (<10 µm)' 'diatoms (>10 µm)' 
+
+SinClusterPlot <- SinkPopulation %>%
+  #cbind(ClusterTime) %>%
+  #filter()
+  dplyr::filter(PhytoGroup %in% PhytoGroupPlot) %>% 
+  mutate(par_ue_f =as.factor(par_ue)) %>%
+  ggplot(aes(x = date_sink, y = sink_vel_mm_min, colour = as.factor(SinkVelo), group = Viability), size = 0.5, show.legend = T) +
+  #geom_line() +
+  #geom_ribbon(aes(y = NULL, ymin = low, ymax = high, fill = Viability, group = Viability), linetype = "dashed", alpha = 0.1, show.legend = F) + 
+  geom_point(aes(x = date_sink, y = sink_vel_mm_min, colour = as.factor(SinkVelo), group = Viability), alpha = 0.1, show.legend = T) +
+  xlab("Elapsed day") +
+  scale_y_continuous(name = "Sinking velocity (mm/min)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  #coord_cartesian(ylim = c(-2.5, 2.5)) +
+  facet_grid(cols = vars(Viability), rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  # scale_fill_manual(values = Colours_Group, labels=c("Alive cells", "Dead cells", "Dead Alive cells")) +    
+  # scale_color_manual(values = Colours_Group, labels=c("Alive cells", "Dead cells", "Dead Alive cells")) + 
+  theme_classic()
+SinClusterPlot
+
+
+ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project,PhytoGroupPlot, "Cluster", "SinkPlot.png", sep = "_"), fsep = .Platform$file.sep), plot = SinClusterPlot, height = 10, width = 12)
+
+SubPop <- Brk_Compare %>%
+  group_by(Viability, par_ue, strain, well) %>%
+  mutate(E_hours = as.numeric((datetime - datetime[1])/3600),
+         E_days = as.numeric((datetime - datetime[1])/86400)
+         )%>%
+  dplyr::filter(BrkptNo == 1,
+         sink_vel_mm_min != Inf,
+         CellcountMax > 1,
+         CellcountDiffSDFlag == 1
+         ) %>%
+  ungroup() %>%
+  full_join(SinkPopulation) %>%
+  drop_na(SinkVelo) %>%
+  mutate(date_sink = (as.character(date_sink))) %>%
+  dplyr::select(date_sink, ElapMin, sink_vel_mm_min, well, Viability, par_ue, strain, sink_hour, SinkVelo)
+
+SelectStrain <- 'PCC6803' #"CCMP495", "CCMP1335", "CCMP1336" "CCMP836", "CZS25K", "PCC6803"
+SelectViability <- "CorrDeadCells" #CorrDeadCells AliveCells DeadAliveCells TotCy5Cells
+
+# ExportCluster <- SubPop %>%
+#   dplyr::filter(
+#          strain %in% SelectStrain,
+#          Viability %in%  SelectViability #CorrDeadCells AliveCells DeadAliveCells TotCy5Cells
+#          ) %>%
+#   pivot_wider(names_from = par_ue, names_prefix = "par", names_sep = "_", values_from = c(sink_vel_mm_min, SinkVelo))
+# 
+# 
+# h5write(ExportCluster, "ExportClusterVelo.h5", name = paste(SelectViability, SelectStrain))
+
+SubPop_AvStrain <- SubPop %>%
+  dplyr::filter(Viability != "TotCy5Cells") %>%
+  dplyr::mutate(Viability_group = case_when(Viability %in% c("CorrDeadCells", "DeadAliveCells") ~ "Dead&Dying",
+                                            Viability %in% c("AliveCells") ~ "Alive")) %>%
+  group_by(Viability_group, strain, par_ue, SinkVelo) %>%
+  summarise(AvSinkVel_mm_min = mean(sink_vel_mm_min), StdSinkVel_mm_min = sd(sink_vel_mm_min)) 
+
+#h5write(SubPop_AvStrain, "ExportMeanVelo.h5", name = paste("MeanSinkVelo_strain"))
+
+SubPop_AvGroup <- SubPop %>%
+  dplyr::filter(Viability != "TotCy5Cells") %>%
+  dplyr::mutate(Viability_group = case_when(Viability %in% c("CorrDeadCells", "DeadAliveCells") ~ "Dead&Dying",
+                                            Viability %in% c("AliveCells") ~ "Alive"),
+                Functional_group = case_when(strain %in% c("CZS25K", "CCMP836", "PCC6803") ~ "picocyanobacteria",
+                                             strain %in% c("CCMP495", "CCMP1335") ~ "nanodiatoms",
+                                             strain %in% c("CCMP1336") ~ "microdiatom")
+                ) %>%
+  group_by(Viability_group, Functional_group, par_ue, SinkVelo) %>%
+  summarise(GroupSinkVel_mm_min = mean(sink_vel_mm_min), StdSinkVel_mm_min = sd(sink_vel_mm_min)) 
+#h5write(SubPop_AvGroup, "ExportMeanVelo.h5", name = paste("MeanSinkVelo_group"))
+
+SubPop_separate <- Brk_Compare %>%
+  dplyr::filter(Viability != "TotCy5Cells") %>%
+  dplyr::mutate(Viability_group = case_when(Viability %in% c("CorrDeadCells", "DeadAliveCells") ~ "Dead&Dying",
+                                            Viability %in% c("AliveCells") ~ "Alive")
+                ) %>%
+  dplyr::filter(BrkptNo == 1,
+         sink_vel_mm_min != Inf,
+         CellcountMax > 1,
+         CellcountDiffSDFlag == 1
+         ) %>%
+  ungroup() %>%
+  full_join(SinkPopulation) %>%
+  drop_na(SinkVelo) %>%
+  mutate(date_sink = (as.character(date_sink))) %>%
+  dplyr::select(date_sink, ElapMin, sink_vel_mm_min, well, Viability, par_ue, strain, SinkVelo, Viability_group)
+
+SelectStrain <- 'PCC6803' #"CCMP495", "CCMP1335", "CCMP1336" "CCMP836", "CZS25K", "PCC6803"
+SelectViability <- "Dead&Dying" #Alive Dead&Dying
+SelectVelo <- 'slow' #slow
+
+ExportCluster <- SubPop_separate %>%
+  dplyr::filter(
+         strain %in% SelectStrain,
+         Viability_group %in%  SelectViability,
+         SinkVelo %in% SelectVelo#CorrDeadCells AliveCells DeadAliveCells TotCy5Cells
+         ) %>%
+  pivot_wider(names_from = c(par_ue, SinkVelo), names_prefix = "par", names_sep = "_", values_from = c(sink_vel_mm_min))
+
+
+#h5write(ExportCluster, "ExportClusterBoxplot.h5", name = paste(SelectViability, SelectStrain, SelectVelo))
+
+```
+
+
+
+``` {r GAM sinking rates}
+library(mgcv)
+library(gridExtra)
+
+
+Brk_GAM <- Brk_Compare %>%
+  group_by(Viability, par_ue, strain, well) %>% 
+  mutate(E_hours = as.numeric((datetime - datetime[1])/3600),
+         E_days = as.numeric((datetime - datetime[1])/86400)
+                                                  ) %>% 
+  dplyr::filter(BrkptNo == 1,
+         sink_vel_mm_min != Inf,
+         CellcountMax > 1,
+         CellcountDiffSDFlag == 1
+         ) %>%
+  ungroup() %>%
+  full_join(SinkPopulation) %>%
+  drop_na(SinkVelo) #drop NAs in SinkVelo as those sink velocities had too few data points to be clustered, mostly dying cells
+
+E_days_pred <- expand_grid(
+  E_days = seq(from=min(0), 
+              to=max(7), 
+              length.out = 8)
+)
+
+#https://stackoverflow.com/questions/49570452/is-it-possible-to-specify-lower-bound-in-response-variable-during-smooth-with-ga 
+# steps included to prohibit negative cell count predictions
+possibGAM = possibly(.f = gam, otherwise = NULL)
+possibPRED = possibly(.f = predict, otherwise = NULL)
+
+# GamDiff <- Brk_GAM %>%
+#   group_by(Viability, par_ue, strain) %>%
+#   nest() %>%
+#   mutate(
+#     GamModel = map(data, ~possibGAM(sink_vel_mm_min ~ s(E_days, k = 4), data = .x, method = "REML")),
+#     predicted = map(GamModel, ~possibPRED(.x, newdata = E_days_pred)),
+#     augmented = map(GamModel, ~augment(.x)),
+#     glance = map(GamModel, ~glance(.x))
+#   )
+# 
+# GamDiffPred <- GamDiff %>%
+#   #unnest(data) %>%
+#   unnest(cols = c(predicted)) %>%
+#   mutate(E_days_Model = seq(from=min(0), 
+#               to=max(7), 
+#               length.out = 8)
+#          )
+# 
+# GamDiffPred %>%
+#   filter(Viability != "TotCy5Cells")  %>%
+#   ggplot(aes(E_days_Model, (predicted))) +
+#   geom_line(aes(colour = as.factor(Viability))) +
+#   facet_grid(cols = vars(strain), rows = vars(par_ue)) +
+#   xlim(1, 8) +
+#   theme_bw()
+
+
+GamDiff <- Brk_GAM %>%
+  # mutate(PhytoGroup = case_when(strain %in% c("CZS25K","PCC6803","CCMP836") ~ "Cyanobacteria",
+  #                               strain %in% c("CCMP495","CCMP1335","CCMP1336") ~ "Diatoms")) %>%
+  dplyr::filter(Viability != "TotCy5Cells") %>%
+  dplyr::mutate(Viability_group = case_when(Viability %in% c("CorrDeadCells", "DeadAliveCells") ~ "Dead&Dying",
+                                            Viability %in% c("AliveCells") ~ "Alive"),
+                Functional_group = case_when(strain %in% c("CZS25K", "CCMP836", "PCC6803") ~ "cyanobacteria",
+                                             strain %in% c("CCMP495", "CCMP1335") ~ "diatoms (<10 µm)",
+                                             strain %in% c("CCMP1336") ~ "diatom (> 10 µm)")
+                ) %>%
+  group_by(Viability_group, par_ue, Functional_group, SinkVelo) %>%
+  nest() %>%
+  mutate(
+    GamModel = map(data, ~possibGAM(sink_vel_mm_min ~ s(E_days, k = 4), data = .x, method = "REML")),
+    predicted = map(GamModel, ~possibPRED(.x, newdata = E_days_pred)),
+    augmented = map(GamModel, ~augment(.x)),
+    glance = map(GamModel, ~glance(.x))
+  )
+
+GamDiffPred <- GamDiff %>%
+  #unnest(data) %>%
+  unnest(cols = c(predicted)) %>%
+  mutate(E_days_Model = seq(from=min(0), 
+              to=max(7), 
+              length.out = 8)
+         )
+
+GamDiffPred %>%
+  #filter(Viability != "TotCy5Cells")  %>%
+  ggplot(aes(E_days_Model, (predicted))) +
+  geom_line(aes(colour = as.factor(Viability_group))) +
+  facet_grid(cols = vars(Functional_group), rows = vars(par_ue)) +
+  xlim(1, 8) +
+  theme_bw()
+
+ GamFitPred <- GamDiff %>%
+  unnest(augmented)
+
+Colours_Group = c(fast_Alive = "#CC0000", slow_Alive = "#FF3300", 'fast_Dead&Dying' = "#0072B2", 'slow_Dead&Dying' = "#00CCFF"
+                  #, fast_DeadAliveCells = "#CC6600", slow_DeadAliveCells = "#E69F00"
+                  ) #https://stackoverflow.com/questions/17180115/manually-setting-group-colors-for-ggplot2
+
+XAxisGrowthLabel <- c("early exp", "mid exp", "late exp", "stationary")
+
+GamSinkPlot <- GamFitPred %>%
+  unite("Cluster_Viability", c('SinkVelo','Viability_group'), sep = "_", remove = FALSE) %>%
+  # filter(Viability != "TotCy5Cells"
+  #        #, SinkVelo == "fast"
+  #        ) %>%
+  mutate(low = .fitted-.se.fit,
+         high = .fitted+.se.fit,
+         par_ue_f =as.factor(par_ue)) %>%
+  ggplot(aes(x = E_days, y = .fitted, colour = Cluster_Viability,  group = Cluster_Viability), size = 0.5, show.legend = F) +
+  geom_line() +
+  geom_ribbon(aes(y = NULL, ymin = low, ymax = high, fill = Cluster_Viability, group = Cluster_Viability), linetype = "dashed", alpha = 0.1, show.legend = F) + 
+  geom_point(aes(x = E_days, y = sink_vel_mm_min, colour = Cluster_Viability,  group = Cluster_Viability), position = "jitter", alpha = 0.1, show.legend = F) +
+  #xlab("Elapsed day") +
+  scale_y_continuous(name = bquote(bold("Sinking velocity"~"(mm"~min^-1~")")), 
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  #coord_cartesian(ylim = c(0, 2)) +
+  facet_grid(cols = vars(Functional_group), rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  scale_fill_manual(values = Colours_Group, labels=c("fast&alive", "fast&dead", "slow&alive",  "slow&dead"
+                                                     #, "fast&dying", "slow&dying"
+                                                     )) +    
+  scale_color_manual(values = Colours_Group, labels=c("fast&alive", "fast&dead", "slow&alive",  "slow&dead"
+                                                      #, "fast&dying", "slow&dying"
+                                                      )) + 
+  scale_x_continuous(breaks = c(1, 3, 5, 7),
+                     #, labels = XAxisGrowthLabel
+                     name = "growth day") +
+  guides(col = guide_legend("Cluster&Viability")) +
+  theme_bw() +
+  theme(text = element_text(size = 8, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.y = element_text(size = 8, face = "bold", color = "black"), axis.text.x = element_text(#angle = 45,
+                           #hjust = 1,
+                           color = "black"), 
+                           axis.text.y = element_text(color = "black"))
+GamSinkPlot
+
+ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, "GAM", "SinkPlot.png", sep = "_"), fsep = .Platform$file.sep), plot = GamSinkPlot, height = 11, width = 11, units = "cm", dpi = 900)
+
+ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, "GAM", "SinkPlot.tiff", sep = "_"), fsep = .Platform$file.sep), plot = GamSinkPlot, height = 11, width = 11, units = "cm", dpi = 900)
+
+# GamSinkPlotSlow <- GamFitPred %>%
+#   filter(Viability != "TotCy5Cells",
+#          SinkVelo == "slow") %>%
+#   mutate(low = .fitted-.se.fit,
+#          high = .fitted+.se.fit,
+#          par_ue_f =as.factor(par_ue)) %>%
+#   ggplot(aes(x = E_days, y = .fitted, colour = Viability, shape = SinkVelo, group = Viability), size = 0.5, show.legend = F) +
+#   geom_line() +
+#   geom_ribbon(aes(y = NULL, ymin = low, ymax = high, fill = Viability, group = Viability), linetype = "dashed", alpha = 0.1, show.legend = F) + 
+#   geom_point(aes(x = E_days, y = sink_vel_mm_min, colour = Viability, shape = SinkVelo, group = Viability), alpha = 0.1, show.legend = F) +
+#   xlab("Elapsed day") +
+#   scale_y_continuous(name = "Sinking velocity (mm/min)",
+#                      sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+#   #coord_cartesian(ylim = c(0, 0.5)) +
+#   facet_grid(cols = vars(PhytoGroup), rows = vars(fct_rev(par_ue_f)), scales = "free") +
+#   scale_fill_manual(values = Colours_Group, labels=c("Alive cells", "Dead cells", "Dead Alive cells")) +    
+#   scale_color_manual(values = Colours_Group, labels=c("Alive cells", "Dead cells", "Dead Alive cells")) + 
+#   theme_classic()
+# GamSinkPlotSlow
+# 
+# p1 <- grid.arrange(grobs= list(GamSinkPlot, GamSinkPlotSlow),
+#              ncol=1, nrow=2)
+# p1
+
+
+
+
+```
+
+
+``` {r GAM Cell sizes}
+library(mgcv)
+library(gridExtra)
+
+
+ElapMin_Model <- expand_grid(
+  ElapMin = seq(from=min(1), 
+              to=max(600), 
+              length.out = 600)
+)
+
+#https://stackoverflow.com/questions/49570452/is-it-possible-to-specify-lower-bound-in-response-variable-during-smooth-with-ga 
+# steps included to prohibit negative cell count predictions
+possibGAM = possibly(.f = gam, otherwise = NULL)
+possibPRED = possibly(.f = predict, otherwise = NULL)
+
+GamSize <- SinkSize %>%
+  # mutate(PhytoGroup = case_when(strain %in% c("CZS25K","PCC6803","CCMP836") ~ "Cyanobacteria",
+  #                               strain %in% c("CCMP495","CCMP1335","CCMP1336") ~ "Diatoms")) %>%
+  group_by(Viability, par_ue, strain) %>%
+  nest() %>%
+  mutate(
+    GamModel = map(data, ~possibGAM(AvCellArea ~ s(ElapMin, k = 20), data = .x, 
+                                         family = "gaussian"(link = "log"),
+                                         method = "REML")),
+    predicted = map(GamModel, ~possibPRED(.x, newdata = ElapMin_Model, type = "response", se.fit = T)),
+    augmented = map(GamModel, ~augment(.x)),
+    glance = map(GamModel, ~glance(.x))
+  )
+
+GamSize_Pred <- GamSize %>%
+  dplyr::select(strain, par_ue, Viability, predicted) %>%
+  dplyr::filter(predicted != "NULL") %>%
+  rowwise() %>%
+  mutate(db = list(cbind(predicted, ElapMin_Model))) %>%
+  dplyr::select(-predicted) %>%
+  unnest(col = db) %>%
+  full_join(SinkSize %>% mutate(ElapMin = round(ElapMin))) %>%
+  dplyr::filter(Viability != "TotCy5Cells",
+                Viability != "DeadAliveCells")  %>%
+  mutate(low = fit-2*se.fit,
+         high = fit+2*se.fit,
+         par_ue_f =as.factor(par_ue)) 
+
+legend_title <- "Viability"
+SizeColors <- c("#FF0000", "#0000FF")
+
+GamSize_CCMP836 <- GamSize_Pred %>%
+  dplyr::filter(strain == "CCMP836") %>%
+  ggplot(aes(ElapMin, fit)) +
+  geom_line(aes(colour = as.factor(Viability)), show.legend = F) +
+  geom_ribbon(aes(ymin = low, ymax = high, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.3, linetype = 2, show.legend = T) +
+  geom_point(aes(x = ElapMin, y = AvCellArea, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.05, show.legend = F) +
+  labs(title = bquote("A - CCMP836"~"("~1.3~ µm~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+GamSize_CCMP836
+
+GamSize_CZS25K <- GamSize_Pred %>%
+  dplyr::filter(strain == "CZS25K") %>%
+  ggplot(aes(ElapMin, fit)) +
+  geom_line(aes(colour = as.factor(Viability)), show.legend = F) +
+  geom_ribbon(aes(ymin = low, ymax = high, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.3, linetype = 2, show.legend = T) +
+  geom_point(aes(x = ElapMin, y = AvCellArea, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.05, show.legend = F) +
+  labs(title = bquote("B - CZS25K"~"("~1.5~ µm~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+GamSize_CZS25K
+
+GamSize_PCC6803 <- GamSize_Pred %>%
+  dplyr::filter(strain == "PCC6803") %>%
+  ggplot(aes(ElapMin, fit)) +
+  geom_line(aes(colour = as.factor(Viability)), show.legend = F) +
+  geom_ribbon(aes(ymin = low, ymax = high, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.3, linetype = 2, show.legend = T) +
+  geom_point(aes(x = ElapMin, y = AvCellArea, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.05, show.legend = F) +
+  labs(title = bquote("C - PCC6803"~"("~2.3~ µm~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+GamSize_PCC6803
+
+GamSize_CCMP495 <- GamSize_Pred %>%
+  dplyr::filter(strain == "CCMP495") %>%
+  ggplot(aes(ElapMin, fit)) +
+  geom_line(aes(colour = as.factor(Viability)), show.legend = F) +
+  geom_ribbon(aes(ymin = low, ymax = high, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.3, linetype = 2, show.legend = T) +
+  geom_point(aes(x = ElapMin, y = AvCellArea, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.05, show.legend = F) +
+  labs(title = bquote("D - CCMP495"~"("~3.9~ µm~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+GamSize_CCMP495
+
+GamSize_CCMP1335 <- GamSize_Pred %>%
+  dplyr::filter(strain == "CCMP1335") %>%
+  ggplot(aes(ElapMin, fit)) +
+  geom_line(aes(colour = as.factor(Viability)), show.legend = F) +
+  geom_ribbon(aes(ymin = low, ymax = high, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.3, linetype = 2, show.legend = T) +
+  geom_point(aes(x = ElapMin, y = AvCellArea, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.05, show.legend = F) +
+  labs(title = bquote("E - CCMP1335"~"("~6.0~ µm~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+GamSize_CCMP1335
+
+GamSize_CCMP1336 <- GamSize_Pred %>%
+  dplyr::filter(strain == "CCMP1336") %>%
+  ggplot(aes(ElapMin, fit)) +
+  geom_line(aes(colour = as.factor(Viability)), show.legend = F) +
+  geom_ribbon(aes(ymin = low, ymax = high, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.3, linetype = 2, show.legend = T) +
+  geom_point(aes(x = ElapMin, y = AvCellArea, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.05, show.legend = F) +
+  labs(title = bquote("F - CCMP1336"~"("~16.3~ µm~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+GamSize_CCMP1336
+
+LayoutNiche <- rbind(c(1, 1, 1, 2, 2, 2, 3, 3, 3), 
+                     c(1, 1, 1, 2, 2, 2, 3, 3, 3),
+                     c(1, 1, 1, 2, 2, 2, 3, 3, 3),
+                     c(4, 4, 4, 5, 5, 5, 6, 6, 6),
+                     c(4, 4, 4, 5, 5, 5, 6, 6, 6),
+                     c(4, 4, 4, 5, 5, 5, 6, 6, 6))
+
+Supplement_GamSize <- grid.arrange(GamSize_CCMP836 + theme(legend.position = 'none'), GamSize_CZS25K + theme(legend.position = 'none'), GamSize_PCC6803 + theme(legend.position = 'none'), 
+                                   GamSize_CCMP495, GamSize_CCMP1335, GamSize_CCMP1336, 
+                                   layout_matrix = LayoutNiche)
+
+ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, "Supplement", "GAM", "SizePlot.png", sep = "_"), fsep = .Platform$file.sep), plot = Supplement_GamSize, height = 22.5, width = 17.8, units = "cm", dpi = 900)
+
+ggsave(filename = file.path(paste(FP1, FP1, PlotFolder, sep = "/"), paste(Project, "Supplement", "GAM", "SizePlot.tiff", sep = "_"), fsep = .Platform$file.sep), plot = Supplement_GamSize, height = 22.5, width = 17.8, units = "cm", dpi = 900)
+
+
+
+```
+
+``` {r GAM cell size over time}
+E_days_pred <- expand_grid(
+  E_days = seq(from=min(0), 
+              to=max(7), 
+              length.out = 8)
+)
+
+GamSize <- SinkSize %>%
+  group_by(Viability, par_ue, strain, well) %>% 
+  mutate(E_days = as.numeric((datetime - datetime[1])/86400)
+         #PhytoGroup = case_when(strain %in% c("CZS25K","PCC6803","CCMP836") ~ "Cyanobacteria",
+  #                              strain %in% c("CCMP495","CCMP1335","CCMP1336") ~ "Diatoms")
+  ) %>%
+  group_by(Viability, par_ue, strain) %>%
+  nest() %>%
+  mutate(
+    GamModel = map(data, ~possibGAM(AvCellArea ~ s(E_days, k = 4), data = .x, 
+                                         family = "gaussian"(link = "log"),
+                                         method = "REML")),
+    predicted = map(GamModel, ~possibPRED(.x, newdata = E_days_pred, type = "response", se.fit = T)),
+    augmented = map(GamModel, ~augment(.x)),
+    glance = map(GamModel, ~glance(.x))
+  )
+
+GamSize_Pred <- GamSize %>%
+  dplyr::select(strain, par_ue, Viability, predicted) %>%
+  dplyr::filter(predicted != "NULL") %>%
+  rowwise() %>%
+  mutate(db = list(cbind(predicted, E_days_pred))) %>%
+  dplyr::select(-predicted) %>%
+  unnest(col = db) %>%
+  full_join(SinkSize %>% group_by(Viability, par_ue, strain, well) %>% mutate(E_days = round(as.numeric((datetime - datetime[1])/86400)))) %>%
+  dplyr::filter(Viability != "TotCy5Cells",
+                Viability != "DeadAliveCells")  %>%
+  mutate(low = fit-2*se.fit,
+         high = fit+2*se.fit,
+         par_ue_f =as.factor(par_ue)) 
+
+legend_title <- "Viability"
+SizeColors <- c("#FF0000", "#0000FF")
+
+GamSize_CCMP836 <- GamSize_Pred %>%
+  dplyr::filter(strain == "CCMP836") %>%
+  ggplot(aes(E_days, fit)) +
+  geom_line(aes(colour = as.factor(Viability)), show.legend = F) +
+  geom_ribbon(aes(ymin = low, ymax = high, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.3, linetype = 2, show.legend = T) +
+  geom_point(aes(x = E_days, y = AvCellArea, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.05, show.legend = F) +
+  labs(title = bquote("A - CCMP836"~"("~0.9~ µm^3~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+GamSize_CCMP836
+
+GamSize_CZS25K <- GamSize_Pred %>%
+  dplyr::filter(strain == "CZS25K") %>%
+  ggplot(aes(E_days, fit)) +
+  geom_line(aes(colour = as.factor(Viability)), show.legend = F) +
+  geom_ribbon(aes(ymin = low, ymax = high, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.3, linetype = 2, show.legend = T) +
+  geom_point(aes(x = E_days, y = AvCellArea, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.05, show.legend = F) +
+  labs(title = bquote("B - CZS25K"~"("~1.8~ µm^3~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+GamSize_CZS25K
+
+GamSize_PCC6803 <- GamSize_Pred %>%
+  dplyr::filter(strain == "PCC6803") %>%
+  ggplot(aes(E_days, fit)) +
+  geom_line(aes(colour = as.factor(Viability)), show.legend = F) +
+  geom_ribbon(aes(ymin = low, ymax = high, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.3, linetype = 2, show.legend = T) +
+  geom_point(aes(x = E_days, y = AvCellArea, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.05, show.legend = F) +
+  labs(title = bquote("C - PCC6803"~"("~6.4~ µm^3~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+GamSize_PCC6803
+
+GamSize_CCMP495 <- GamSize_Pred %>%
+  dplyr::filter(strain == "CCMP495") %>%
+  ggplot(aes(E_days, fit)) +
+  geom_line(aes(colour = as.factor(Viability)), show.legend = F) +
+  geom_ribbon(aes(ymin = low, ymax = high, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.3, linetype = 2, show.legend = T) +
+  geom_point(aes(x = E_days, y = AvCellArea, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.05, show.legend = F) +
+  labs(title = bquote("D - CCMP495"~"("~31~ µm^3~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+GamSize_CCMP495
+
+GamSize_CCMP1335 <- GamSize_Pred %>%
+  dplyr::filter(strain == "CCMP1335") %>%
+  ggplot(aes(E_days, fit)) +
+  geom_line(aes(colour = as.factor(Viability)), show.legend = F) +
+  geom_ribbon(aes(ymin = low, ymax = high, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.3, linetype = 2, show.legend = T) +
+  geom_point(aes(x = E_days, y = AvCellArea, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.05, show.legend = F) +
+  labs(title = bquote("E - CCMP1335"~"("~119.5~ µm^3~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+GamSize_CCMP1335
+
+GamSize_CCMP1336 <- GamSize_Pred %>%
+  dplyr::filter(strain == "CCMP1336") %>%
+  ggplot(aes(E_days, fit)) +
+  geom_line(aes(colour = as.factor(Viability)), show.legend = F) +
+  geom_ribbon(aes(ymin = low, ymax = high, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.3, linetype = 2, show.legend = T) +
+  geom_point(aes(x = E_days, y = AvCellArea, color = as.factor(Viability), fill = as.factor(Viability)), alpha = 0.05, show.legend = F) +
+  labs(title = bquote("F - CCMP1336"~"("~2950~ µm^3~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+GamSize_CCMP1336
+
+LayoutNiche <- rbind(c(1, 1, 1, 2, 2, 2, 3, 3, 3), 
+                     c(1, 1, 1, 2, 2, 2, 3, 3, 3),
+                     c(1, 1, 1, 2, 2, 2, 3, 3, 3),
+                     c(4, 4, 4, 5, 5, 5, 6, 6, 6),
+                     c(4, 4, 4, 5, 5, 5, 6, 6, 6),
+                     c(4, 4, 4, 5, 5, 5, 6, 6, 6))
+
+Supplement_GamSize <- grid.arrange(GamSize_CCMP836 + theme(legend.position = 'none'), GamSize_CZS25K + theme(legend.position = 'none'), GamSize_PCC6803 + theme(legend.position = 'none'), 
+                                   GamSize_CCMP495, GamSize_CCMP1335, GamSize_CCMP1336, 
+                                   layout_matrix = LayoutNiche)
+```
+
+
+
+``` {r Boxplots AvCellSizes}
+SinkSize %>%
+  dplyr::filter(Viability == "AliveCells") %>%
+  ggplot(aes(x = as.factor(date_sink), y = log10(AvCellArea))) +
+  geom_boxplot(aes(color = strain)) +
+  facet_grid(rows = vars(par_ue), cols = vars(strain))
+
+
+legend_title <- "Viability"
+SizeColors <- c("#FF0000", "#0000FF")
+
+SinkSize_CCMP836 <- SinkSize %>%
+  dplyr::filter(strain == "CCMP495") %>%
+  dplyr::filter(Viability != "TotCy5Cells",
+                Viability != "DeadAliveCells",
+                Viability != "CorrDeadCells")  %>%
+  mutate(par_ue_f = as.factor(par_ue)) %>%
+  ggplot(aes(x = as.factor(date_sink), y = (AvCellArea))) +
+  geom_boxplot(aes(colour = as.factor(Viability)), show.legend = T) +
+  labs(title = bquote("A - CCMP836"~"("~0.9~ µm^3~")")) + 
+  scale_y_continuous(name = "Average Cell Area (pixel)",
+                     sec.axis = sec_axis(~., name = "Photon flux rate (µE)", breaks = NULL, labels = NULL)) +
+  scale_fill_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) + 
+  scale_color_manual(legend_title, values = SizeColors, labels = c("Alive", "Dead")) +
+  facet_grid(rows = vars(fct_rev(par_ue_f)), scales = "free") +
+  coord_cartesian(ylim = c(0, NA)) +
+  theme_bw() +
+  theme(text = element_text(size = 10, face = "bold", color = "black"), plot.title = element_text(size = 10, face = "bold", color = "black"), strip.background = element_rect(fill="white"), legend.position = "bottom", axis.title.x = element_blank(), axis.text.x = element_text(color = "black"), axis.text.y = element_text(color = "black"))
+SinkSize_CCMP836
+
+```
 
 
 ``` {r averaged replicates, warning = FALSE}
